@@ -71,7 +71,7 @@ If you use this code, please cite:
   year = {2025},
   publisher = {GitHub},
   url = {https://github.com/miosync-masa/AdS_CFT},
-  doi = {10.5281/zenodo.xxxxx}
+  doi = {10.5281/zenodo.17506699}
 }
 ```
 
