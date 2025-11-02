@@ -1,0 +1,245 @@
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+from .geometry import (
+    laplacian2d, perimeter_len_bool8, corner_count, count_holes_nonperiodic,
+    inner_boundary_band, outer_boundary_band, k_th_largest_mask
+)
+
+@dataclass
+class Cell:
+    alive: bool
+    energy: float
+    genome: np.ndarray
+    coop: float
+
+def _rng(seed: int):
+    return np.random.default_rng(seed)
+
+def mutate(genome: np.ndarray, mut_rate: float, rng) -> np.ndarray:
+    g = genome.copy()
+    flips = rng.random(len(g)) < mut_rate
+    g[flips] = 1 - g[flips]
+    return g
+
+class Automaton:
+    """AdS/CFT-aware self-evolving automaton with HR and delayed geodesic gating."""
+    def __init__(self, H=44, W=44, Z=24, L_ads=1.0, alpha=0.9,
+                 c0=0.08, gamma=0.8, c_eff_max=0.18,
+                 gate_delay:int=1, gate_strength:float=0.15,
+                 soc_rate: float = 0.01,
+                 seed: int = 913):
+        self.H,self.W,self.Z = H,W,Z
+        self.L_ads=float(L_ads); self.alpha=float(alpha); self.G_N=1.0
+        self.c0=float(c0); self.gamma=float(gamma); self.c_eff_max=float(c_eff_max)
+        self.gate_delay=int(gate_delay); self.gate_strength=float(gate_strength)
+        self.soc_rate=float(soc_rate)
+        self.rng = _rng(seed)
+
+        self.grid = self._init_grid(H,W,G=56)
+        self.resource=np.ones((H,W),dtype=float)
+        self.boundary=self.coop_field()
+        self.bulk=np.zeros((H,W,Z),dtype=float)
+        self.pending_masks: List[Optional[np.ndarray]] = [None]*(self.gate_delay+1)
+
+    # ---------- init ----------
+    def _init_grid(self, H:int, W:int, G:int) -> List[List[Cell]]:
+        grid=[]
+        for i in range(H):
+            row=[]
+            for j in range(W):
+                row.append(Cell(
+                    alive=True,
+                    energy=float(1.0 + 0.2*self.rng.standard_normal()),
+                    genome=self.rng.integers(0,2,size=G,dtype=np.int8),
+                    coop=float(np.clip(0.5 + 0.2*self.rng.standard_normal(), 0, 1))
+                ))
+            grid.append(row)
+        # add spatial seeds (checkerboard + Gaussian)
+        for i in range(H):
+            for j in range(W):
+                if ((i//4 + j//4) % 2)==0:
+                    grid[i][j].coop=float(np.clip(grid[i][j].coop*1.25,0,1))
+                else:
+                    grid[i][j].coop=float(np.clip(grid[i][j].coop*0.75,0,1))
+        cy,cx = H//2, W//2
+        for i in range(H):
+            for j in range(W):
+                r2=(i-cy)**2+(j-cx)**2
+                boost=np.exp(-r2/(H/4)**2)
+                grid[i][j].coop=float(np.clip(grid[i][j].coop*(1+0.4*boost),0,1))
+        return grid
+
+    # ---------- fields ----------
+    def coop_field(self) -> np.ndarray:
+        M = np.zeros((self.H,self.W),dtype=float)
+        for i in range(self.H):
+            for j in range(self.W):
+                if self.grid[i][j].alive:
+                    M[i,j]=self.grid[i][j].coop
+        return M
+
+    def K_over_V(self, B: np.ndarray) -> np.ndarray:
+        coop = np.clip(B, 0, 1)
+        gx = np.roll(coop, -1, 1) - coop
+        gy = np.roll(coop, -1, 0) - coop
+        K = np.sqrt(gx*gx + gy*gy) + 1e-12
+        V = np.abs(coop - float(coop.mean())) + 1e-12
+        return K / V
+
+    # ---------- dynamics ----------
+    def step_agents(self):
+        H,W = self.H,self.W
+        C = self.coop_field()
+        for i in range(H):
+            for j in range(W):
+                c = self.grid[i][j]
+                if not c.alive: 
+                    continue
+                take = min(0.05, self.resource[i,j])
+                self.resource[i,j]-=take; c.energy += take
+                give = min(0.02*c.coop, c.energy)
+                if give>0:
+                    q=0.25*give
+                    self.grid[(i+1)%H][j].energy += q
+                    self.grid[(i-1)%H][j].energy += q
+                    self.grid[i][(j+1)%W].energy += q
+                    self.grid[i][(j-1)%W].energy += q
+                    c.energy -= give
+                neigh = 0.25*(C[(i+1)%H][j]+C[(i-1)%H][j]+C[i][(j+1)%W]+C[i][(j-1)%W])
+                c.coop += 0.05*(neigh - c.coop) + 0.01*self.rng.standard_normal()
+                c.coop = float(np.clip(c.coop, 0, 1))
+                if c.energy < 0.15:
+                    c.alive=False; c.coop=0.0
+                elif c.energy > 2.0 and self.rng.random()<0.01:
+                    child = Cell(True, c.energy*0.5, mutate(c.genome,0.02,self.rng), c.coop)
+                    c.energy *= 0.5
+                    ii,jj = (i + self.rng.integers(-1,2))%H, (j + self.rng.integers(-1,2))%W
+                    self.grid[ii][jj] = child
+        self.resource += 0.03*laplacian2d(self.resource) + 0.004
+        self.resource = np.clip(self.resource, 0, 3)
+
+    def update_bulk(self):
+        L0 = self.K_over_V(self.boundary)
+        self.bulk[...,0] = L0
+        dz = 1.0/self.Z; z = (np.arange(self.Z)+1)*dz
+        for k in range(1, self.Z):
+            warp = (self.L_ads / z[k])**2
+            prev = self.bulk[...,k-1]
+            mixed = prev + 0.012*laplacian2d(prev)
+            self.bulk[...,k] = np.clip(warp * mixed, 0, None)
+
+    def HR(self, c_eff: float):
+        dz = 1.0/self.Z; z = (np.arange(self.Z)+1)*dz
+        w = np.exp(-self.alpha * z); w = w / (w.sum() + 1e-12)
+        back = np.tensordot(self.bulk, w, axes=(2,0))
+        self.boundary += c_eff * (back - self.boundary)
+        self.boundary = np.clip(self.boundary, 0, 1)
+
+    def update_boundary_payoff(self):
+        B = self.boundary
+        neigh = 0.25*(np.roll(B,1,0)+np.roll(B,-1,0)+np.roll(B,1,1)+np.roll(B,-1,1))
+        payoff = neigh*(1.4 - 0.6*B) - 0.4*B*(1 - neigh)
+        self.boundary += 0.08 * payoff
+        self.boundary = np.clip(self.boundary, 0, 1)
+
+    def SOC_tune(self):
+        Lb = self.K_over_V(self.coop_field())
+        delta = float(Lb.mean() - 1.0)
+        self.boundary = np.clip(self.boundary - self.soc_rate*delta, 0, 1)
+
+    # ---------- geometry (A region) ----------
+    def region_A(self, step:int) -> np.ndarray:
+        C = self.coop_field(); alive = C>0
+        if alive.sum()==0:
+            R = np.zeros((self.H,self.W),bool); R[:, :self.W//2]=True; return R
+        thr = float(np.median(C[alive]))
+        high = C>=thr
+        k = 0 if (step%2==0) else 1  # alternate largest/second largest
+        R = k_th_largest_mask(high, k)
+        if R.sum()==0:
+            R = k_th_largest_mask(high, 0)
+        return R
+
+    def S_RT_multiobjective(self, R: np.ndarray, w_len=1.0, w_hole=2.0, w_curv=0.5):
+        perim = perimeter_len_bool8(R)
+        holes = count_holes_nonperiodic(R)
+        curv  = float(corner_count(R))
+        S = (w_len*perim + w_hole*holes + w_curv*curv) / (4.0 * self.G_N)
+        return float(S), dict(perimeter=float(perim), holes=float(holes), curvature=float(curv))
+
+    # ---------- geodesic gating ----------
+    def compute_gate_mask(self, R: np.ndarray, Lb_pre: np.ndarray) -> Optional[np.ndarray]:
+        out = outer_boundary_band(R, 1)
+        if not out.any():
+            return None
+        vals = Lb_pre[out]
+        if len(vals) < 10:
+            return None
+        q1, q3 = np.percentile(vals, [25, 75])
+        iqr = q3 - q1 + 1e-12
+        thresh = q3 + 1.5*iqr
+        lam_p99 = np.percentile(vals, 99)
+        if lam_p99 > thresh:
+            return out.copy()
+        return None
+
+    def apply_pending_gate(self) -> int:
+        mask = self.pending_masks.pop(0)
+        self.pending_masks.append(None)
+        if mask is not None and mask.any():
+            B = self.boundary
+            B[mask] = np.clip(B[mask] + self.gate_strength*(1.0 - B[mask]), 0, 1)
+            self.boundary = B
+            return int(mask.sum())
+        return 0
+
+    # ---------- one step (manual to expose pre/post) ----------
+    def step_once(self, step:int, weights=(1.0,2.0,0.5)) -> Dict:
+        self.step_agents()
+        self.boundary = self.coop_field()
+        self.update_bulk()
+
+        R = self.region_A(step)
+        Lb_pre = self.K_over_V(self.boundary)
+
+        out_band = outer_boundary_band(R, 1)
+        in_band  = inner_boundary_band(R, 1)
+
+        lam_p99_out_pre = float(np.percentile(Lb_pre[out_band], 99)) if out_band.any() else np.nan
+        lam_p99_in_pre  = float(np.percentile(Lb_pre[in_band],  99)) if in_band.any() else np.nan
+
+        medG = float(np.median(Lb_pre))
+        norm_tail = (lam_p99_out_pre/(medG+1e-12) - 1.0) if out_band.any() else 0.0
+        norm_tail = float(np.clip(norm_tail, -0.5, 3.0))
+        c_eff = float(np.clip(self.c0*(1.0 + self.gamma*norm_tail), 0.08, self.c_eff_max))
+
+        self.HR(c_eff)
+        applied_px = self.apply_pending_gate()
+        new_mask = self.compute_gate_mask(R, Lb_pre)
+        if new_mask is not None:
+            self.pending_masks[-1] = new_mask
+
+        self.update_boundary_payoff()
+        self.SOC_tune()
+
+        S_mo, parts = self.S_RT_multiobjective(R, *weights)
+        Lb_post = self.K_over_V(self.boundary)
+        lam_p99_out_post = float(np.percentile(Lb_post[out_band],99)) if out_band.any() else np.nan
+        lam_p99_in_post  = float(np.percentile(Lb_post[in_band], 99)) if in_band.any() else np.nan
+
+        return dict(
+            t=step,
+            entropy_RT_mo=S_mo,
+            region_A_size=float(R.sum()),
+            region_A_perimeter=parts["perimeter"],
+            region_A_holes=parts["holes"],
+            region_A_curvature=parts["curvature"],
+            lambda_p99_A_out_pre=lam_p99_out_pre,
+            lambda_p99_A_in_pre=lam_p99_in_pre,
+            lambda_p99_A_out_post=lam_p99_out_post,
+            lambda_p99_A_in_post=lam_p99_in_post,
+            c_eff=c_eff,
+            gate_applied_px=int(applied_px)
+        )
