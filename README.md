@@ -66,11 +66,11 @@ into a single, **executable model**.
 If you use this code, please cite:
 ```bibtex
 @software{iizumi2025lambda3,
-  author = {Iizumi, Masamichi and Makise, Kurisu},
+  author = {Iizumi, Masamichi},
   title = {Λ³ Spacetime Emergence Framework},
   year = {2025},
   publisher = {GitHub},
-  url = {https://github.com/[username]/lambda3-spacetime},
+  url = {https://github.com/miosync-masa/AdS_CFT},
   doi = {10.5281/zenodo.xxxxx}
 }
 ```
