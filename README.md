@@ -49,8 +49,17 @@ into a single, **executable model**.
 - Multi-objective RT functional (perimeter + holes + curvature)
 
 ## Quick Start
-bash
-python scripts/run_ixb.py
+
+### Virtual environment (optional)
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+### PhaseShift-IXb（delay=1）
+python -m lambda3_holo.run_experiment --preset ixb --outdir out_ixb
+
+### PhaseShift-IXc（delay=2）
+python -m lambda3_holo.run_experiment --preset ixc --outdir out_ixc
+
 ```
 
 ## Key Results
