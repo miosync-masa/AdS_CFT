@@ -49,6 +49,8 @@ into a single, **executable model**.
 - Multi-objective RT functional (perimeter + holes + curvature)
 
 ## Quick Start
+bash
+python scripts/run_ixb.py
 ```
 
 ## Key Results
