@@ -12,9 +12,6 @@ Key components:
 - Geodesic Gating: Discrete RT surface rewiring
 - Holographic Renormalization: Bulk → Boundary feedback
 
-References:
-    Iizumi, M., & Makise, K. (2025). Complete Proof of Spacetime Emergence
-    from Critical Quantum Information. arXiv:2025.xxxxx
 """
 
 from dataclasses import dataclass
