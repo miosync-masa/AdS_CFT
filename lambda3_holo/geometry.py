@@ -106,6 +106,6 @@ def count_holes_nonperiodic(mask: np.ndarray) -> int:
                     ci,cj = q.popleft()
                     for di,dj in ((1,0),(-1,0),(0,1),(0,-1)):
                         ni, nj = ci+di, cj+dj
-                        if 0<=ni<H and 0<=nj<W and inv[ni,nj] and not vis[i,nj]:
+                        if 0<=ni<H and 0<=nj<W and inv[ni,nj] and not vis[ni,nj]:
                             vis[ni,nj]=True; q.append((ni,nj))
     return holes
