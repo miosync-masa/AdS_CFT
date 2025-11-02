@@ -1,5 +1,7 @@
 # AdS_CFT
 
+We thank the open-source community and future researchers who will build upon this work
+
 # MIT License
 Copyright (c) 2025 Masamichi Iizumi
 
