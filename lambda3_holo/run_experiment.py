@@ -17,17 +17,14 @@ def run_experiment(args):
     os.makedirs(args.outdir, exist_ok=True)
     
     # Initialize automaton with full parameter set
-    ua = Automaton(
-        H=args.H, W=args.W, Z=args.Z, 
+       ua = Automaton(
+        H=args.H, W=args.W, Z=args.Z,
         L_ads=args.L_ads, alpha=args.alpha,
         c0=args.c0, gamma=args.gamma, c_eff_max=args.c_eff_max,
-        gate_delay=args.gate_delay, gate_strength=args.gate_strength,
-        soc_rate=args.soc_rate, seed=args.seed
+        gate_strength=args.gate_strength,  # delay削除！
+        seed=args.seed
     )
-    
-    # Reset state explicitly for reproducibility
-    ua.reset_state()
-    
+        
     # Run with burn-in period
     print(f"[INFO] Running {args.preset}: burn-in={args.burnin}, measure={args.steps}")
     rows = ua.run_with_burnin(
@@ -135,7 +132,7 @@ def run_experiment(args):
     print(f"  TE λ→S={TE_x_to_y:.4f}, S→λ={TE_y_to_x:.4f}")
     
     # Success indicator
-    if best_lag > 0 and rho_s > 0.4:
+    if best_lag > 0 and rho_s > 0.5:
         print(f"  ✓ SUCCESS: Positive lag with strong monotonic correlation!")
     elif best_lag > 0:
         print(f"  ⚠ PARTIAL: Positive lag but weak correlation (ρ={rho_s:.3f})")
@@ -223,91 +220,57 @@ def run_experiment(args):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Lambda3 Holography — PhaseShift runner with burn-in support"
+        description="Lambda3 Holography — PhaseShift-VIII Enhanced"
     )
     
-    # Preset configurations
-    p.add_argument("--preset", type=str, default="ixb", 
-                   choices=["ixb", "ixc", "custom"],
-                   help="Preset: ixb (delay=1), ixc (delay=2), custom (use args)")
+    # Preset configurations - シンプルに
+    p.add_argument("--preset", type=str, default="viii", 
+                   choices=["viii", "custom"],
+                   help="Preset: viii (immediate gating), custom")
     
     # Output
     p.add_argument("--outdir", type=str, default="out",
-                   help="Output directory for results")
+                   help="Output directory")
     
     # Simulation parameters
     p.add_argument("--burnin", type=int, default=200,
-                   help="Burn-in steps before measurement")
+                   help="Burn-in steps")
     p.add_argument("--steps", type=int, default=300,
-                   help="Measurement steps after burn-in")
+                   help="Measurement steps")
     
     # Grid geometry
-    p.add_argument("--H", type=int, default=44,
-                   help="Grid height")
-    p.add_argument("--W", type=int, default=44,
-                   help="Grid width")
-    p.add_argument("--Z", type=int, default=24,
-                   help="Bulk depth (z-layers)")
+    p.add_argument("--H", type=int, default=44)
+    p.add_argument("--W", type=int, default=44)
+    p.add_argument("--Z", type=int, default=24)
     
     # AdS/CFT parameters
-    p.add_argument("--L_ads", type=float, default=1.0,
-                   help="AdS radius")
-    p.add_argument("--alpha", type=float, default=0.9,
-                   help="HR decay rate")
-    p.add_argument("--c0", type=float, default=0.08,
-                   help="Base coupling strength")
-    p.add_argument("--gamma", type=float, default=0.8,
-                   help="Coupling amplification")
-    p.add_argument("--c_eff_max", type=float, default=0.18,
-                   help="Maximum HR coupling (zero-lag suppression)")
+    p.add_argument("--L_ads", type=float, default=1.0)
+    p.add_argument("--alpha", type=float, default=0.9)
+    p.add_argument("--c0", type=float, default=0.08)
+    p.add_argument("--gamma", type=float, default=0.9)
+    p.add_argument("--c_eff_max", type=float, default=0.18)
     
-    # Geodesic gating
-    p.add_argument("--gate_delay", type=int, default=1,
-                   help="Gate application delay (steps)")
-    p.add_argument("--gate_strength", type=float, default=0.15,
+    # Gate strength only (no delay!)
+    p.add_argument("--gate_strength", type=float, default=0.25,
                    help="Gate boost magnitude")
     
-    # SOC
-    p.add_argument("--soc_rate", type=float, default=0.01,
-                   help="SOC tuning rate")
-    
     # Random seed
-    p.add_argument("--seed", type=int, default=913,
-                   help="Random seed for reproducibility")
-    
-    # RT weights
-    p.add_argument("--w_len", type=float, default=1.0,
-                   help="Weight for perimeter term")
-    p.add_argument("--w_hole", type=float, default=2.0,
-                   help="Weight for hole count")
-    p.add_argument("--w_curv", type=float, default=0.5,
-                   help="Weight for curvature")
+    p.add_argument("--seed", type=int, default=913)
     
     # Analysis
-    p.add_argument("--maxlag", type=int, default=40,
-                   help="Maximum lag for cross-correlation")
+    p.add_argument("--maxlag", type=int, default=40)
     
     args = p.parse_args()
     
-    # Apply preset configurations
-    if args.preset == "ixb":
-        print("[CONFIG] Using preset IXb: gate_delay=1")
-        args.gate_delay = 0
-        args.gate_strength = 0.15
-        args.steps = max(args.steps, 300)
-        args.burnin = max(args.burnin, 200)
-        
-    elif args.preset == "ixc":
-        print("[CONFIG] Using preset IXc: gate_delay=2")
-        args.gate_delay = 1
-        args.gate_strength = 0.15
-        args.steps = max(args.steps, 300)
-        args.burnin = max(args.burnin, 200)
-        
+    # Apply preset
+    if args.preset == "viii":
+        print("[CONFIG] Using PhaseShift-VIII Enhanced: immediate gating")
+        args.gate_strength = 0.25
+        args.outdir = "out_viii"
+    
     return args
 
 def main():
-    """Main entry point"""
     args = parse_args()
     run_experiment(args)
 
