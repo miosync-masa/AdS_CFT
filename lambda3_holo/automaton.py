@@ -432,102 +432,91 @@ class Automaton:
         return False
     
     def _step_internal(self, step: int, record: bool = True) -> Optional[Dict]:
-        """CRITICAL: Proper causal ordering"""
+        """シンプル＆同時点測定"""
         
-        # A) Pre-snapshot (this is "time t boundary")
-        B_pre = self.boundary.copy()
-        Lambda_b_pre = self.K_over_V(B_pre)
-        R_pre = self.region_A(step)
-        out_band_pre = outer_boundary_band(R_pre, 1)
-        in_band_pre = inner_boundary_band(R_pre, 1)
+        # ===== 1. 現在時点の測定（全部同じ境界で！） =====
+        B_now = self.boundary.copy()
+        Lambda_b = self.K_over_V(B_now)
+        R = self.region_A(step)
         
-        lam_p99_out_pre = float(np.percentile(Lambda_b_pre[out_band_pre], 99)) if out_band_pre.any() else np.nan
-        lam_p99_in_pre = float(np.percentile(Lambda_b_pre[in_band_pre], 99)) if in_band_pre.any() else np.nan
+        out_band = outer_boundary_band(R, 1)
+        in_band = inner_boundary_band(R, 1)
         
-        # B) Bulk from PRE boundary
-        self.update_bulk_from(B_pre)
+        # 同時点で測定！
+        lam_p99_out = float(np.percentile(Lambda_b[out_band], 99)) if out_band.any() else np.nan
+        lam_p99_in = float(np.percentile(Lambda_b[in_band], 99)) if in_band.any() else np.nan
+        S_mo, parts = self.S_RT_multiobjective(R)  # ← 同じRで測定
         
-        # C) HR with delayed c_eff
+        # ===== 2. 物理更新（シンプルに順番に） =====
+        # Bulk
+        self.update_bulk_from(B_now)
+        
+        # HR
         self.HR(self.c_eff_current)
         
-        # D) Apply delayed gate
-        gate_px = self._apply_pending_gate_exact()
+        # ゲート検出＆適用
+        self._lambda_hist.append(lam_p99_out)
+        if len(self._lambda_hist) == self._lambda_hist.maxlen:
+            window = np.array(self._lambda_hist)
+            if self._detect_outlier_enhanced(window) and out_band.any():
+                vals = Lambda_b[out_band]
+                p98 = np.percentile(vals, 98)
+                mask = out_band & (Lambda_b >= p98)
+                if mask.any():
+                    # delay=0なら即適用
+                    self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
+                    self.boundary = np.clip(self.boundary, 0, 1)
+                    gate_px = int(mask.sum())
+                else:
+                    gate_px = 0
+            else:
+                gate_px = 0
+        else:
+            gate_px = 0
         
-        # E) Boundary dynamics
+        # Payoff & SOC
         self.update_boundary_payoff()
         self.SOC_tune()
         
-        # F) Measure S_RT with POST geometry
-        R_post = self.region_A(step)
-        S_mo, parts = self.S_RT_multiobjective(R_post)
+        # Agents & Coupling
+        self.step_agents()
+        self.agents_to_boundary_coupling(rate=0.20)
         
-        # G) Detect and enqueue
-        self._lambda_hist.append(lam_p99_out_pre)
-        new_mask = None
-        if len(self._lambda_hist) == self._lambda_hist.maxlen:
-            window = np.array(self._lambda_hist)
-            if self._detect_outlier_enhanced(window) and out_band_pre.any():
-                vals = Lambda_b_pre[out_band_pre]
-                p98 = np.percentile(vals, 98)
-                cand = out_band_pre & (Lambda_b_pre >= p98)
-                new_mask = cand if cand.any() else None
-        
-        # ★修正：delay=0なら即座に適用、delay>0ならキューに入れる★
-        if self.gate_delay == 0:
-            # 即座に適用
-            if new_mask is not None and new_mask.any():
-                self.boundary[new_mask] += self.gate_strength * (1.0 - self.boundary[new_mask])
-                self.boundary = np.clip(self.boundary, 0, 1)
-                gate_px = int(new_mask.sum())  # ここで適用したピクセル数を記録
-        else:
-            # キューに入れる（多重発火抑制なし！）
-            if len(self.pending_gates) > 0:
-                self.pending_gates[-1] = new_mask
-        
-        # H) Compute next c_eff (z-score amplification)
+        # c_eff更新（次ステップ用）
         z = 0.0
         if len(self._lambda_hist) >= 10:
-            arr = np.array(self._lambda_hist, dtype=float)
-            mu, sd = float(arr.mean()), float(arr.std() + 1e-12)
-            z = (lam_p99_out_pre - mu) / sd
+            arr = np.array(self._lambda_hist)
+            mu, sd = arr.mean(), arr.std() + 1e-12
+            z = (lam_p99_out - mu) / sd
         
         self.c_eff_current = float(np.clip(
             self.c0 * (1.0 + self.gamma * max(0.0, z)),
-            self.c0,
-            self.c_eff_max
+            self.c0, self.c_eff_max
         ))
         
-        # I) NOW update agents (AFTER boundary measurements)
-        self.step_agents()
-        
-        # J) Agent→Boundary weak coupling
-        self.agents_to_boundary_coupling(rate=0.20)
-        
-        # K) Micro noise
+        # ノイズ
         self.boundary += 0.002 * self.rng_noise.standard_normal(self.boundary.shape)
         self.boundary = np.clip(self.boundary, 0, 1)
         
         if not record:
             return None
         
-        # Debug logging
+        # ===== 3. 記録（同時点測定値を使う！） =====
         if step % 25 == 0:
-            print(f"[t={step:03d}] λ_pre={lam_p99_out_pre:.3f}  S_RT={S_mo:.3f}  "
-                  f"gate_px={gate_px}  c_eff={self.c_eff_current:.3f}")
+            print(f"[t={step:03d}] λ={lam_p99_out:.3f}  S_RT={S_mo:.3f}  "
+                  f"gate={gate_px}  c_eff={self.c_eff_current:.3f}")
         
         return dict(
             t=step,
-            entropy_RT_mo=S_mo,
-            region_A_size=float(R_post.sum()),
+            entropy_RT_mo=S_mo,  # ← 同時点！
+            lambda_p99_A_out_pre=lam_p99_out,  # ← 同時点！
+            lambda_p99_A_in_pre=lam_p99_in,
+            region_A_size=float(R.sum()),
             region_A_perimeter=parts["perimeter"],
             region_A_holes=parts["holes"],
             region_A_curvature=parts["curvature"],
-            lambda_p99_A_out_pre=lam_p99_out_pre,
-            lambda_p99_A_in_pre=lam_p99_in_pre,
-            lambda_p99_A_out_post=np.nan,
-            lambda_p99_A_in_post=np.nan,
             c_eff=self.c_eff_current,
-            gate_applied_px=int(gate_px)
+            gate_applied_px=gate_px
         )
     
     def run_with_burnin(self, burn_in: int = 250, measure_steps: int = 300) -> List[Dict]:
