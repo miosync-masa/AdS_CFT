@@ -292,14 +292,14 @@ def parse_args():
     # Apply preset configurations
     if args.preset == "ixb":
         print("[CONFIG] Using preset IXb: gate_delay=1")
-        args.gate_delay = 1
+        args.gate_delay = 0
         args.gate_strength = 0.15
         args.steps = max(args.steps, 300)
         args.burnin = max(args.burnin, 200)
         
     elif args.preset == "ixc":
         print("[CONFIG] Using preset IXc: gate_delay=2")
-        args.gate_delay = 2
+        args.gate_delay = 1
         args.gate_strength = 0.15
         args.steps = max(args.steps, 300)
         args.burnin = max(args.burnin, 200)
