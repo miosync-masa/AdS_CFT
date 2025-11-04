@@ -141,7 +141,7 @@ class AdSCFTParams:
     """
     
     # Bulk geometry
-    BULK_DIFFUSION: float = 0.012
+    BULK_DIFFUSION: float = 0.010
     """Bulk field diffusion coefficient
     
     Physical meaning: Information spreading in AdS interior
