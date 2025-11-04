@@ -461,7 +461,7 @@ class Automaton:
         R_post = self.region_A(step)
         S_mo, parts = self.S_RT_multiobjective(R_post)
         
-        # G) Detect new spike and enqueue
+        # G) Detect and enqueue
         self._lambda_hist.append(lam_p99_out_pre)
         new_mask = None
         if len(self._lambda_hist) == self._lambda_hist.maxlen:
@@ -472,13 +472,17 @@ class Automaton:
                 cand = out_band_pre & (Lambda_b_pre >= p98)
                 new_mask = cand if cand.any() else None
         
-        # ★修正：dequeをリストに変換してチェック★
-        if self.gate_delay > 0 and len(self.pending_gates) > 0:
-            # 多重発火抑制：既にキューに何か入ってたら新規追加しない
-            has_pending = any(m is not None for m in list(self.pending_gates))
-            if new_mask is not None and has_pending:
-                new_mask = None
-            self.pending_gates[-1] = new_mask  # 最後尾を上書き
+        # ★修正：delay=0なら即座に適用、delay>0ならキューに入れる★
+        if self.gate_delay == 0:
+            # 即座に適用
+            if new_mask is not None and new_mask.any():
+                self.boundary[new_mask] += self.gate_strength * (1.0 - self.boundary[new_mask])
+                self.boundary = np.clip(self.boundary, 0, 1)
+                gate_px = int(new_mask.sum())  # ここで適用したピクセル数を記録
+        else:
+            # キューに入れる（多重発火抑制なし！）
+            if len(self.pending_gates) > 0:
+                self.pending_gates[-1] = new_mask
         
         # H) Compute next c_eff (z-score amplification)
         z = 0.0
