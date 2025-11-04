@@ -278,7 +278,6 @@ class Automaton:
         self.resource = np.clip(self.resource, 0, self.resource_config.RESOURCE_MAX)
         
         # CRITICAL: NO boundary overwrite here!
-        # self.boundary = self.coop_field()  ← DELETED!
     
     def agents_to_boundary_coupling(self, rate: float = 0.20):
         """NEW: Weak coupling from agents to boundary"""
@@ -400,13 +399,19 @@ class Automaton:
             holes=float(holes),
             curvature=float(curv)
         )
-    
+
     def _apply_pending_gate_exact(self) -> int:
-        """Apply gate with exact delay"""
-        if self.gate_delay <= 0 or len(self.pending_gates) == 0:
+        """Apply gate with exact delay (maintain queue length)"""
+        if self.gate_delay <= 0:
             return 0
         
-        mask = self.pending_gates.popleft()  # 取り出す（delay前のもの）
+        # キューが空なら何もしない
+        if len(self.pending_gates) == 0:
+            return 0
+            
+        mask = self.pending_gates.popleft()
+        self.pending_gates.append(None)  # ★長さ維持のため空を追加
+        
         if mask is not None and mask.any():
             self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
             self.boundary = np.clip(self.boundary, 0, 1)
@@ -467,32 +472,25 @@ class Automaton:
                 cand = out_band_pre & (Lambda_b_pre >= p98)
                 new_mask = cand if cand.any() else None
         
-        # Multi-fire suppression and enqueue
-        if self.gate_delay > 0 and not any(m is not None for m in self.pending_gates):
-            self.pending_gates[-1] = new_mask
+        # ★シンプルなエンキュー（最後尾を上書き）★
+        if self.gate_delay > 0 and len(self.pending_gates) > 0:
+            # 多重発火抑制：既にキューに何か入ってたらnew_maskを捨てる
+            if new_mask is not None and any(m is not None for m in self.pending_gates[:-1]):
+                new_mask = None
+            self.pending_gates[-1] = new_mask  # 最後尾を上書き
         
         # H) Compute next c_eff (z-score amplification)
-        self._lambda_hist.append(lam_p99_out_pre)
-        new_mask = None
-        if len(self._lambda_hist) == self._lambda_hist.maxlen:
-            window = np.array(self._lambda_hist)
-            if self._detect_outlier_enhanced(window) and out_band_pre.any():
-                vals = Lambda_b_pre[out_band_pre]
-                p98 = np.percentile(vals, 98)
-                cand = out_band_pre & (Lambda_b_pre >= p98)
-                new_mask = cand if cand.any() else None
+        z = 0.0
+        if len(self._lambda_hist) >= 10:
+            arr = np.array(self._lambda_hist, dtype=float)
+            mu, sd = float(arr.mean()), float(arr.std() + 1e-12)
+            z = (lam_p99_out_pre - mu) / sd
         
-        # ★修正：長さを維持しながらエンキュー★
-        if self.gate_delay > 0:
-            # 長さが足りない場合は補充
-            while len(self.pending_gates) < self.gate_delay:
-                self.pending_gates.append(None)
-            
-            # 多重発火抑制
-            if new_mask is not None and any(m is not None for m in self.pending_gates):
-                new_mask = None  # すでに何か入ってたらスキップ
-            
-            self.pending_gates.append(new_mask) 
+        self.c_eff_current = float(np.clip(
+            self.c0 * (1.0 + self.gamma * max(0.0, z)),
+            self.c0,
+            self.c_eff_max
+        ))
         
         # I) NOW update agents (AFTER boundary measurements)
         self.step_agents()
