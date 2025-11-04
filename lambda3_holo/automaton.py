@@ -452,12 +452,13 @@ class Automaton:
         # ===== A. MEASURE PRE-LAMBDA =====
         B_pre = self.boundary.copy()
         Lambda_b_pre = self.K_over_V(B_pre)
-        R_pre = self.region_A(step)  # ← outlier検出用
-        out_band_pre = outer_boundary_band(R_pre, 1)
-        in_band_pre = inner_boundary_band(R_pre, 1)
+        R = self.region_A(step)  # ★最初はRのままで！
+        out_band = outer_boundary_band(R, 1)
+        in_band = inner_boundary_band(R, 1)
         
-        lam_p99_out_pre = float(np.percentile(Lambda_b_pre[out_band_pre], 99)) if out_band_pre.any() else np.nan
-
+        lam_p99_out_pre = float(np.percentile(Lambda_b_pre[out_band], 99)) if out_band.any() else np.nan
+        lam_p99_in_pre = float(np.percentile(Lambda_b_pre[in_band], 99)) if in_band.any() else np.nan
+        
         # ===== B. PHYSICS UPDATES =====
         self.step_agents()
         self.boundary = self.coop_field()
@@ -475,7 +476,8 @@ class Automaton:
         self.update_boundary_payoff()
         self.SOC_tune()
         
-        # ===== G. MEASURE POST-S_RT =====
+        # ===== G. MEASURE POST-S_RT（★更新後の領域で再計算！） =====
+        R = self.region_A(step)  # ★ここで取り直す！
         S_mo, parts = self.S_RT_multiobjective(R)
         
         # PATCH 5: Add micro dithering noise
@@ -498,13 +500,15 @@ class Automaton:
                 new_mask = None
         else:
             new_mask = None
-
+        
+        # ★多重発火抑制
         if any(m is not None for m in self.pending_gates):
             new_mask = None
-        self.pending_gates[-1] = new_mask
-        # Don't append to deque here - popleft/append is handled in _apply_pending_gate_exact
         
-        # ===== I. COMPUTE NEXT c_eff (PATCH 3: z-score amplification) =====
+        # ★エンキューを忘れずに！
+        self.pending_gates[-1] = new_mask
+        
+        # ===== I. COMPUTE NEXT c_eff (z-score amplification) =====
         if len(self._lambda_hist) >= 10:
             arr = np.array(self._lambda_hist, dtype=float)
             mu = float(arr.mean())
@@ -514,7 +518,7 @@ class Automaton:
             z = 0.0
         
         self.c_eff_current = float(np.clip(
-            self.c0 * (1.0 + self.gamma * max(0.0, z)),  # Only amplify for z > 0
+            self.c0 * (1.0 + self.gamma * max(0.0, z)),
             self.c0,
             self.c_eff_max
         ))
