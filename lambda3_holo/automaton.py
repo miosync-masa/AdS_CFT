@@ -318,17 +318,22 @@ class Automaton:
             prev = self.bulk[..., k - 1]
             mixed = prev + self.ads_cft.BULK_DIFFUSION * laplacian2d(prev)
             self.bulk[..., k] = np.clip(warp * mixed, 0, None)
-    
-    def HR(self, c_eff: float):
-        """Holographic renormalization"""
+            
+    def HR_back_from_bulk(self) -> np.ndarray:
+        """Return bulk→boundary backreaction field (do not apply)."""
         dz = 1.0 / self.Z
         z = (np.arange(self.Z) + 1) * dz
         w = np.exp(-self.alpha * z)
         w = w / (w.sum() + 1e-12)
         back = np.tensordot(self.bulk, w, axes=(2, 0))
-        self.boundary += c_eff * (back - self.boundary)
-        self.boundary = np.clip(self.boundary, 0, 1)
-    
+        return back  # ← self.boundary はここでは触らない
+
+    def gate_delta_from_mask(self, Bref: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+        """Return gate-induced increment field (do not apply)."""
+        if mask is None or not mask.any():
+            return np.zeros_like(Bref)
+        return self.gate_strength * (1.0 - Bref) * mask
+
     def update_boundary_payoff(self):
         """Game-theoretic payoff dynamics"""
         B = self.boundary
@@ -432,94 +437,90 @@ class Automaton:
         return False
     
     def _step_internal(self, step: int, record: bool = True) -> Optional[Dict]:
-        """CRITICAL: Proper causal ordering"""
-        
-        # A) Pre-snapshot (this is "time t boundary")
-        B_pre = self.boundary.copy()
-        Lambda_b_pre = self.K_over_V(B_pre)
+        # === A) 観測面（保存） ===
+        B_cur = self.boundary.copy()                 # B(t)
+        Lambda_b_pre = self.K_over_V(B_cur)          # λ_pre(t)
         R_pre = self.region_A(step)
         out_band_pre = outer_boundary_band(R_pre, 1)
-        in_band_pre = inner_boundary_band(R_pre, 1)
-        
+        in_band_pre  = inner_boundary_band(R_pre, 1)
+    
         lam_p99_out_pre = float(np.percentile(Lambda_b_pre[out_band_pre], 99)) if out_band_pre.any() else np.nan
-        lam_p99_in_pre = float(np.percentile(Lambda_b_pre[in_band_pre], 99)) if in_band_pre.any() else np.nan
-        
-        # B) Bulk from PRE boundary
-        self.update_bulk_from(B_pre)
-        
-        # C) HR with delayed c_eff
-        self.HR(self.c_eff_current)
-        
-        # D) Apply delayed gate
-        gate_px = self._apply_pending_gate_exact()
-        
-        # E) Boundary dynamics
-        self.update_boundary_payoff()
-        self.SOC_tune()
-        
-        # F) Measure S_RT with POST geometry
-        R_post = self.region_A(step)
-        S_mo, parts = self.S_RT_multiobjective(R_post)
-        
-        # G) Detect new spike and enqueue
+        lam_p99_in_pre  = float(np.percentile(Lambda_b_pre[in_band_pre],  99)) if in_band_pre.any()  else np.nan
+    
+        # === B) bulk を B(t) から更新（forward 路）===
+        self.update_bulk_from(B_cur)
+    
+        # === C) backreaction と gate の“効果”だけ計算（まだ境界に適用しない）===
+        back = self.HR_back_from_bulk()                          # field
+        gate_mask_to_apply = self.pending_gates.popleft()        # ちょうど delay ステップ前
+        self.pending_gates.append(None)                          # スロット前進
+        gate_delta = self.gate_delta_from_mask(B_cur, gate_mask_to_apply)
+    
+        # === D) S_RT は B(t) で測る（更新前幾何）===
+        S_mo, parts = self.S_RT_multiobjective(R_pre)
+    
+        # === E) 新しいスパイクを検出し、キューの最後に積む（多重発火抑制）===
         self._lambda_hist.append(lam_p99_out_pre)
         new_mask = None
-        if len(self._lambda_hist) == self._lambda_hist.maxlen:
+        if len(self._lambda_hist) == self._lambda_hist.maxlen and out_band_pre.any():
             window = np.array(self._lambda_hist)
-            if self._detect_outlier_enhanced(window) and out_band_pre.any():
+            if self._detect_outlier_enhanced(window):
                 vals = Lambda_b_pre[out_band_pre]
-                p98 = np.percentile(vals, 98)
+                p98  = np.percentile(vals, 98)
                 cand = out_band_pre & (Lambda_b_pre >= p98)
                 new_mask = cand if cand.any() else None
-        
-        # Multi-fire suppression and enqueue
         if self.gate_delay > 0 and not any(m is not None for m in self.pending_gates):
             self.pending_gates[-1] = new_mask
-        
-        # H) Compute next c_eff (z-score amplification)
+    
+        # === F) 次ステップに向けた“更新の蓄積”を作る（まだ commit しない）===
+        # 境界内部ダイナミクス
+        B_payoff = B_cur.copy()
+        B_payoff += self.ads_cft.BOUNDARY_PAYOFF_RATE * (
+            0.25 * (np.roll(B_cur,1,0)+np.roll(B_cur,-1,0)+np.roll(B_cur,1,1)+np.roll(B_cur,-1,1)) * (1.4 - 0.6*B_cur)
+            - 0.4 * B_cur * (1 - 0.25 * (np.roll(B_cur,1,0)+np.roll(B_cur,-1,0)+np.roll(B_cur,1,1)+np.roll(B_cur,-1,1)))
+        )
+        # SOC（測定フェーズは rate=0.0 なら無視）
+        rate = self.soc_rate_burnin if self.phase == 'burnin' else self.soc_rate_measure
+        if rate > 0.0:
+            Lb_mean = float(self.K_over_V(self.coop_field()).mean())
+            B_payoff -= rate * (Lb_mean - self.ads_cft.LAMBDA_CRITICAL)
+    
+        # agent → boundary の弱結合（**0.05** 推奨）
+        C = self.coop_field()
+        B_next = B_payoff + self.c_eff_current * (back - B_cur) + gate_delta + 0.05 * (C - B_cur)
+        # 微小ノイズ
+        B_next += 0.002 * self.rng_noise.standard_normal(B_next.shape)
+        self.boundary = np.clip(B_next, 0, 1)  # ← ここで初めて commit ＝ B(t+1)
+    
+        # === G) 次ステップ用 c_eff（z>0 のときだけ増幅）===
         z = 0.0
         if len(self._lambda_hist) >= 10:
             arr = np.array(self._lambda_hist, dtype=float)
             mu, sd = float(arr.mean()), float(arr.std() + 1e-12)
             z = (lam_p99_out_pre - mu) / sd
-        
         self.c_eff_current = float(np.clip(
             self.c0 * (1.0 + self.gamma * max(0.0, z)),
-            self.c0,
-            self.c_eff_max
+            self.c0, self.c_eff_max
         ))
-        
-        # I) NOW update agents (AFTER boundary measurements)
+    
+        # === H) ここで agent を進める（B はすでに t+1 に更新済だが上書きはしない）===
         self.step_agents()
-        
-        # J) Agent→Boundary weak coupling
-        self.agents_to_boundary_coupling(rate=0.20)
-        
-        # K) Micro noise
-        self.boundary += 0.002 * self.rng_noise.standard_normal(self.boundary.shape)
-        self.boundary = np.clip(self.boundary, 0, 1)
-        
-        if not record:
-            return None
-        
-        # Debug logging
-        if step % 25 == 0:
+    
+        if record and step % 25 == 0:
             print(f"[t={step:03d}] λ_pre={lam_p99_out_pre:.3f}  S_RT={S_mo:.3f}  "
-                  f"gate_px={gate_px}  c_eff={self.c_eff_current:.3f}")
-        
+                  f"gate_px={(gate_mask_to_apply.sum() if isinstance(gate_mask_to_apply, np.ndarray) else 0)}  "
+                  f"c_eff={self.c_eff_current:.3f}")
+    
         return dict(
             t=step,
             entropy_RT_mo=S_mo,
-            region_A_size=float(R_post.sum()),
+            region_A_size=float(R_pre.sum()),
             region_A_perimeter=parts["perimeter"],
             region_A_holes=parts["holes"],
             region_A_curvature=parts["curvature"],
             lambda_p99_A_out_pre=lam_p99_out_pre,
             lambda_p99_A_in_pre=lam_p99_in_pre,
-            lambda_p99_A_out_post=np.nan,
-            lambda_p99_A_in_post=np.nan,
             c_eff=self.c_eff_current,
-            gate_applied_px=int(gate_px)
         )
     
     def run_with_burnin(self, burn_in: int = 250, measure_steps: int = 300) -> List[Dict]:
