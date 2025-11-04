@@ -138,7 +138,6 @@ class Automaton:
         # Full state reset
         self.reset_state()
 
-
     def _init_grid(self) -> List[List[Cell]]:
         """
         Initialize agent grid using dedicated init RNG stream.
@@ -203,7 +202,189 @@ class Automaton:
         B[:] = np.clip(B + noise, 0, 1)
         
         self.boundary = B
+
+    def coop_field(self) -> np.ndarray:
+        """Extract cooperation field from agent grid"""
+        M = np.zeros((self.H, self.W), dtype=float)
+        for i in range(self.H):
+            for j in range(self.W):
+                if self.grid[i][j].alive:
+                    M[i, j] = self.grid[i][j].coop
+        return M
+    
+    def step_agents(self):
+        """Update agent dynamics using dedicated RNG streams"""
+        H, W = self.H, self.W
+        C = self.coop_field()
         
+        # Get config values
+        harvest_rate = self.agent.HARVEST_RATE
+        share_rate = self.agent.SHARE_RATE
+        coop_update_rate = self.agent.COOP_UPDATE_RATE
+        thermal_noise = self.agent.THERMAL_NOISE
+        death_threshold = self.agent.DEATH_THRESHOLD
+        birth_threshold = self.agent.BIRTH_THRESHOLD
+        birth_prob = self.agent.BIRTH_PROBABILITY
+        mutation_rate = self.agent.MUTATION_RATE
+        
+        for i in range(H):
+            for j in range(W):
+                c = self.grid[i][j]
+                if not c.alive:
+                    continue
+                
+                # Harvest resources
+                take = min(harvest_rate, self.resource[i, j])
+                self.resource[i, j] -= take
+                c.energy += take
+                
+                # Share with neighbors
+                give = min(share_rate * c.coop, c.energy)
+                if give > 0:
+                    q = 0.25 * give
+                    self.grid[(i + 1) % H][j].energy += q
+                    self.grid[(i - 1) % H][j].energy += q
+                    self.grid[i][(j + 1) % W].energy += q
+                    self.grid[i][(j - 1) % W].energy += q
+                    c.energy -= give
+                
+                # Update cooperation (use noise RNG)
+                neigh = 0.25 * (
+                    C[(i + 1) % H][j] + C[(i - 1) % H][j] +
+                    C[i][(j + 1) % W] + C[i][(j - 1) % W]
+                )
+                c.coop += coop_update_rate * (neigh - c.coop) 
+                c.coop += thermal_noise * self.rng_noise.standard_normal()
+                c.coop = float(np.clip(c.coop, 0, 1))
+                
+                # Death check
+                if c.energy < death_threshold:
+                    c.alive = False
+                    c.coop = 0.0
+                
+                # Birth (use core RNG)
+                elif c.energy > birth_threshold and self.rng_core.random() < birth_prob:
+                    child = Cell(
+                        True,
+                        c.energy * 0.5,
+                        self._mutate(c.genome, mutation_rate),
+                        c.coop
+                    )
+                    c.energy *= 0.5
+                    ii = (i + self.rng_core.integers(-1, 2)) % H
+                    jj = (j + self.rng_core.integers(-1, 2)) % W
+                    self.grid[ii][jj] = child
+        
+        # Update resource field
+        self.resource += self.resource_config.RESOURCE_DIFFUSION * laplacian2d(self.resource)
+        self.resource += self.resource_config.RESOURCE_REPLENISH
+        self.resource = np.clip(self.resource, 0, self.resource_config.RESOURCE_MAX)
+    
+    def _mutate(self, genome: np.ndarray, mut_rate: float) -> np.ndarray:
+        """Mutate genome using core RNG"""
+        g = genome.copy()
+        flips = self.rng_core.random(len(g)) < mut_rate
+        g[flips] = 1 - g[flips]
+        return g
+    
+    def update_bulk(self):
+        """Update bulk Lambda field with AdS warping"""
+        L0 = self.K_over_V(self.boundary)
+        self.bulk[..., 0] = L0
+        dz = 1.0 / self.Z
+        z = (np.arange(self.Z) + 1) * dz
+        
+        for k in range(1, self.Z):
+            warp = (self.L_ads / z[k])**2
+            prev = self.bulk[..., k - 1]
+            mixed = prev + self.ads_cft.BULK_DIFFUSION * laplacian2d(prev)
+            self.bulk[..., k] = np.clip(warp * mixed, 0, None)
+    
+    def HR(self, c_eff: float):
+        """Holographic renormalization: bulk → boundary feedback"""
+        dz = 1.0 / self.Z
+        z = (np.arange(self.Z) + 1) * dz
+        w = np.exp(-self.alpha * z)
+        w = w / (w.sum() + 1e-12)
+        back = np.tensordot(self.bulk, w, axes=(2, 0))
+        self.boundary += c_eff * (back - self.boundary)
+        self.boundary = np.clip(self.boundary, 0, 1)
+    
+    def update_boundary_payoff(self):
+        """Update boundary via game-theoretic payoff"""
+        B = self.boundary
+        neigh = 0.25 * (
+            np.roll(B, 1, 0) + np.roll(B, -1, 0) +
+            np.roll(B, 1, 1) + np.roll(B, -1, 1)
+        )
+        payoff = neigh * (1.4 - 0.6 * B) - 0.4 * B * (1 - neigh)
+        self.boundary += self.ads_cft.BOUNDARY_PAYOFF_RATE * payoff
+        self.boundary = np.clip(self.boundary, 0, 1)
+    
+    def region_A(self, step: int) -> np.ndarray:
+        """Define region A for RT entropy calculation"""
+        C = self.coop_field()
+        alive = C > 0
+        if alive.sum() == 0:
+            R = np.zeros((self.H, self.W), bool)
+            R[:, :self.W // 2] = True
+            return R
+        thr = float(np.median(C[alive]))
+        high = C >= thr
+        k = 0 if (step % 2 == 0) else 1  # Alternate between largest/second
+        R = k_th_largest_mask(high, k)
+        if R.sum() == 0:
+            R = k_th_largest_mask(high, 0)
+        return R
+    
+    def S_RT_multiobjective(
+        self,
+        R: np.ndarray,
+        w_len: Optional[float] = None,
+        w_hole: Optional[float] = None,
+        w_curv: Optional[float] = None
+    ) -> Tuple[float, Dict[str, float]]:
+        """Compute multi-objective RT entropy"""
+        if w_len is None:
+            w_len = self.rt_weights.WEIGHT_PERIMETER
+        if w_hole is None:
+            w_hole = self.rt_weights.WEIGHT_HOLES
+        if w_curv is None:
+            w_curv = self.rt_weights.WEIGHT_CURVATURE
+        
+        perim = perimeter_len_bool8(R)
+        holes = count_holes_nonperiodic(R)
+        curv = float(corner_count(R))
+        S = (w_len * perim + w_hole * holes + w_curv * curv) / (4.0 * self.G_N)
+        
+        return float(S), dict(
+            perimeter=float(perim),
+            holes=float(holes),
+            curvature=float(curv)
+        )
+    
+    def _compute_gate_mask_exact(self, Lambda_b: np.ndarray, R: np.ndarray) -> np.ndarray:
+        """Compute gate mask deterministically"""
+        out_band = outer_boundary_band(R, 1)
+        if not out_band.any():
+            return None
+        
+        # Use top 2% of Lambda values in outer band
+        vals = Lambda_b[out_band]
+        p98 = np.percentile(vals, 98)
+        mask = out_band & (Lambda_b >= p98)
+        return mask if mask.any() else None
+    
+    def _apply_pending_gate_exact(self) -> int:
+        """Apply gate from exactly delay steps ago"""
+        if len(self.pending_gates) > 0:
+            mask = self.pending_gates[0]  # Oldest mask
+            if mask is not None and mask.any():
+                self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
+                self.boundary = np.clip(self.boundary, 0, 1)
+                return int(mask.sum())
+        return 0    
+    
     def reset_state(self):
         """
         Complete state reset to ensure reproducibility.
