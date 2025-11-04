@@ -433,7 +433,7 @@ class Automaton:
     
     def _step_internal(self, step: int, record: bool = True) -> Optional[Dict]:
         """シンプル＆同時点測定"""
-        gate_px = 0  
+        applied_pixels = 0 
         
         # ===== 1. 現在時点の測定（全部同じ境界で！） =====
         B_now = self.boundary.copy()
@@ -464,16 +464,17 @@ class Automaton:
                 p98 = np.percentile(vals, 98)
                 mask = out_band & (Lambda_b >= p98)
                 if mask.any():
-                    print(f"[DEBUG] Gate triggered! pixels={mask.sum()}")  # デバッグ！
+                    pixels = int(mask.sum())
+                    print(f"[DEBUG] Gate triggered! pixels={pixels}")
                     self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
                     self.boundary = np.clip(self.boundary, 0, 1)
-                    gate_px = int(mask.sum())
+                    applied_pixels = pixels
                 else:
-                    gate_px = 0
+                    applied_pixels = 0
             else:
-                gate_px = 0
+                applied_pixels = 0
         else:
-            gate_px = 0
+            applied_pixels = 0
         
         # Payoff & SOC
         self.update_boundary_payoff()
@@ -505,7 +506,7 @@ class Automaton:
         # ===== 3. 記録（同時点測定値を使う！） =====
         if step % 25 == 0:
             print(f"[t={step:03d}] λ={lam_p99_out:.3f}  S_RT={S_mo:.3f}  "
-                  f"gate={gate_px}  c_eff={self.c_eff_current:.3f}")
+                  f"gate={gate_applied_px}  c_eff={self.c_eff_current:.3f}")
         
         return dict(
             t=step,
@@ -517,7 +518,7 @@ class Automaton:
             region_A_holes=parts["holes"],
             region_A_curvature=parts["curvature"],
             c_eff=self.c_eff_current,
-            gate_applied_px=gate_px
+            gate_applied_px=applied_pixels
         )
     
     def run_with_burnin(self, burn_in: int = 250, measure_steps: int = 300) -> List[Dict]:
