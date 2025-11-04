@@ -80,7 +80,7 @@ class Automaton:
             self.W = config.W
             self.Z = config.Z
             self.agent = config.agent
-            self.resource = config.resource
+            self.resource_config = config.resource 
             self.ads_cft = config.ads_cft
             self.gating = config.gating
             self.rt_weights = config.rt_weights
@@ -91,7 +91,7 @@ class Automaton:
             self.W = W
             self.Z = Z
             self.agent = AgentDynamics()
-            self.resource = ResourceDynamics()
+            self.resource_config = ResourceDynamics() 
             self.ads_cft = AdSCFTParams(
                 L_ADS=L_ads,
                 ALPHA=alpha,
@@ -235,9 +235,9 @@ class Automaton:
                     self.grid[ii][jj] = child
         
         # Resource dynamics
-        self.resource += self.agent.RESOURCE_DIFFUSION * laplacian2d(self.resource)
-        self.resource += self.agent.RESOURCE_REPLENISH
-        self.resource = np.clip(self.resource, 0, self.agent.RESOURCE_MAX)
+        self.resource += self.resource_config.RESOURCE_DIFFUSION * laplacian2d(self.resource)
+        self.resource += self.resource_config.RESOURCE_REPLENISH
+        self.resource = np.clip(self.resource, 0, self.resource_config.RESOURCE_MAX)
 
     def update_bulk(self):
         L0 = self.K_over_V(self.boundary)
