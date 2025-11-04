@@ -17,7 +17,7 @@ def run_experiment(args):
     os.makedirs(args.outdir, exist_ok=True)
     
     # Initialize automaton with full parameter set
-       ua = Automaton(
+    ua = Automaton(
         H=args.H, W=args.W, Z=args.Z,
         L_ads=args.L_ads, alpha=args.alpha,
         c0=args.c0, gamma=args.gamma, c_eff_max=args.c_eff_max,
