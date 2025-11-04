@@ -137,7 +137,73 @@ class Automaton:
         
         # Full state reset
         self.reset_state()
+
+
+    def _init_grid(self) -> List[List[Cell]]:
+        """
+        Initialize agent grid using dedicated init RNG stream.
+        Ensures reproducibility across runs with same seed.
+        """
+        grid = []
+        for i in range(self.H):
+            row = []
+            for j in range(self.W):
+                row.append(Cell(
+                    alive=True,
+                    energy=float(1.0 + 0.2 * self.rng_init.standard_normal()),
+                    genome=self.rng_init.integers(0, 2, size=56, dtype=np.int8),
+                    coop=float(np.clip(0.5 + 0.2 * self.rng_init.standard_normal(), 0, 1))
+                ))
+            grid.append(row)
+        return grid
     
+    def _apply_spatial_pattern(self):
+        """Apply deterministic spatial patterns (checkerboard + Gaussian)"""
+        H, W = self.H, self.W
+        
+        # Checkerboard pattern
+        for i in range(H):
+            for j in range(W):
+                if ((i // 4 + j // 4) % 2) == 0:
+                    self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 1.25, 0, 1))
+                else:
+                    self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 0.75, 0, 1))
+        
+        # Gaussian boost at center
+        cy, cx = H // 2, W // 2
+        for i in range(H):
+            for j in range(W):
+                r2 = (i - cy)**2 + (j - cx)**2
+                boost = np.exp(-r2 / (H / 4)**2)
+                self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * (1 + 0.4 * boost), 0, 1))
+    
+    def _apply_spatial_seed(self):
+        """Add extra spatial roughness to prevent λ=1 lock-in"""
+        H, W = self.H, self.W
+        B = self.boundary
+        
+        # Enhanced checkerboard pattern (3x3 blocks for more variation)
+        for i in range(H):
+            for j in range(W):
+                if ((i // 3 + j // 3) & 1) == 0:
+                    B[i, j] = np.clip(B[i, j] * 1.25 + 0.02, 0, 1)
+                else:
+                    B[i, j] = np.clip(B[i, j] * 0.75 - 0.02, 0, 1)
+        
+        # Stronger Gaussian bump at center
+        cy, cx = H // 2, W // 2
+        for i in range(H):
+            for j in range(W):
+                r2 = (i - cy)**2 + (j - cx)**2
+                bump = np.exp(-r2 / (H / 4)**2)
+                B[i, j] = np.clip(B[i, j] + 0.15 * bump, 0, 1)
+        
+        # Add random noise for initial diversity
+        noise = self.rng_init.uniform(-0.05, 0.05, (H, W))
+        B[:] = np.clip(B + noise, 0, 1)
+        
+        self.boundary = B
+        
     def reset_state(self):
         """
         Complete state reset to ensure reproducibility.
