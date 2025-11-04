@@ -464,12 +464,18 @@ class Automaton:
                 p98 = np.percentile(vals, 98)
                 mask = out_band & (Lambda_b >= p98)
                 if mask.any():
-                    applied_pixels = int(mask.sum())  # ここで代入
-                    print(f"[DEBUG] Gate triggered! pixels={applied_pixels}")
+                    pixels = int(mask.sum())
+                    print(f"[DEBUG] Gate triggered! pixels={pixels}")
                     print(f"[DEBUG] Before gate: boundary mean={self.boundary.mean():.3f}")
-                    self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
+                    
+                    # ★境界を下げる方向に変更！
+                    self.boundary[mask] *= (1.0 - self.gate_strength)  # 15%減少
+                    # または
+                    # self.boundary[mask] -= self.gate_strength * self.boundary[mask]
+                    
                     self.boundary = np.clip(self.boundary, 0, 1)
                     print(f"[DEBUG] After gate: boundary mean={self.boundary.mean():.3f}")
+                    applied_pixels = pixels
         
         print(f"[DEBUG] applied_pixels before return: {applied_pixels}") 
         
