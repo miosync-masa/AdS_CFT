@@ -183,7 +183,7 @@ class Automaton:
                 r2 = (i - cy)**2 + (j - cx)**2
                 boost = np.exp(-r2 / (H / 4)**2)
                 self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * (1 + 0.4 * boost), 0, 1))
-    
+
     def _apply_spatial_seed(self):
         """Add EXTREME spatial roughness to break λ=1 lock-in"""
         H, W = self.H, self.W
@@ -204,7 +204,7 @@ class Automaton:
                 B[i, j] = np.clip(B[i, j] + 0.3 * bump, 0, 1)
         
         noise = self.rng_init.uniform(-0.1, 0.1, (H, W))
-        B[:] = np.clip(B + noise, 0, 1)
+        B[:] = np.clip(B + noise, 0, 0.95)  # ★ここ！1を0.95に変える！
         self.boundary = B
 
     def coop_field(self) -> np.ndarray:
