@@ -1,11 +1,13 @@
 """
-lambda3_holo/automaton.py - Fully reproducible AdS/CFT automaton with RNG separation
+lambda3_holo/automaton.py - Complete version with fixed causality
+Fully reproducible AdS/CFT automaton with proper temporal ordering
 """
 
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Union
 from numpy.random import Generator, PCG64, SeedSequence
+from collections import deque
 
 from .geometry import (
     laplacian2d, perimeter_len_bool8, corner_count, count_holes_nonperiodic,
@@ -35,13 +37,14 @@ class Cell:
 class Automaton:
     """
     AdS/CFT-aware self-evolving automaton with holographic renormalization
-    and delayed geodesic gating. Fully reproducible with RNG stream separation.
+    and delayed geodesic gating. Fixed temporal ordering ensures positive lag.
     
     Key features:
     - Complete RNG independence between subsystems
-    - Full state reset capability
-    - Burn-in period support
-    - Deterministic geodesic gating
+    - Proper delay queue with deque for exact timing
+    - Correct temporal ordering: λ(t) → gate(t+delay) → S_RT(t+delay)
+    - Burn-in period support for stability
+    - Zero-lag suppression via c_eff delay
     """
     
     def __init__(
@@ -56,10 +59,10 @@ class Automaton:
         alpha: float = 0.9,
         c0: float = 0.08,
         gamma: float = 0.8,
-        c_eff_max: float = 0.18,
+        c_eff_max: float = 0.17,  # Reduced from 0.18 for zero-lag suppression
         # Gating params (legacy)
         gate_delay: int = 1,
-        gate_strength: float = 0.15,
+        gate_strength: float = 0.12,  # Reduced from 0.15
         # SOC (legacy)
         soc_rate: float = 0.01,
         # Random seed
@@ -141,12 +144,17 @@ class Automaton:
         self.boundary = np.zeros((H, W), dtype=float)
         self.resource = np.ones((H, W), dtype=float)
         
-        # CRITICAL: Clear pending gates queue
-        self.pending_masks = [None] * (self.gate_delay + 1)
+        # CRITICAL: Use deque for exact delay (FIFO queue)
+        self.pending_gates = deque(maxlen=self.gate_delay + 1)
+        for _ in range(self.gate_delay + 1):
+            self.pending_gates.append(None)
         
-        # Clear cached values
-        self.last_region_A = None
-        self.hr_weights = None
+        # Lambda history for outlier detection
+        self._lambda_hist = []
+        self._win = 96  # Increased window size to reduce false positives
+        
+        # Current c_eff (delayed by 1 step to avoid zero-lag)
+        self.c_eff_current = self.c0
         
         # Initialize grid with deterministic RNG
         self.grid = self._init_grid()
@@ -376,105 +384,115 @@ class Automaton:
             curvature=float(curv)
         )
     
-    def compute_gate_mask(self, R: np.ndarray, Lb_pre: np.ndarray) -> Optional[np.ndarray]:
-        """
-        Detect outliers and create gate mask using gate RNG.
-        Uses Tukey's outlier detection (IQR method).
-        """
-        out = outer_boundary_band(R, 1)
-        if not out.any():
-            return None
-        vals = Lb_pre[out]
-        if len(vals) < 10:
-            return None
-        
-        q1, q3 = np.percentile(vals, [25, 75])
+    def _detect_outlier_tukey(self, series_window: np.ndarray) -> bool:
+        """Tukey's outlier detection on window"""
+        q1, q3 = np.percentile(series_window, [25, 75])
         iqr = q3 - q1 + 1e-12
-        thresh = q3 + self.gating.IQR_MULTIPLIER * iqr
-        lam_p99 = np.percentile(vals, 99)
-        
-        if lam_p99 > thresh:
-            return out.copy()
-        return None
+        return series_window[-1] > q3 + 1.5 * iqr
     
-    def apply_pending_gate(self) -> int:
-        """Apply delayed geodesic gate from queue"""
-        mask = self.pending_masks.pop(0)
-        self.pending_masks.append(None)
-        if mask is not None and mask.any():
-            B = self.boundary
-            B[mask] = np.clip(
-                B[mask] + self.gate_strength * (1.0 - B[mask]),
-                0, 1
-            )
-            self.boundary = B
-            return int(mask.sum())
+    def _compute_gate_mask_exact(self, Lambda_b: np.ndarray, R: np.ndarray) -> np.ndarray:
+        """Compute gate mask deterministically"""
+        out_band = outer_boundary_band(R, 1)
+        if not out_band.any():
+            return None
+        
+        # Use top 2% of Lambda values in outer band
+        vals = Lambda_b[out_band]
+        p98 = np.percentile(vals, 98)
+        mask = out_band & (Lambda_b >= p98)
+        return mask if mask.any() else None
+    
+    def _apply_pending_gate_exact(self) -> int:
+        """Apply gate from exactly delay steps ago"""
+        if len(self.pending_gates) > 0:
+            mask = self.pending_gates[0]  # Oldest mask (delay steps ago)
+            if mask is not None and mask.any():
+                # Apply gate with reduced strength
+                self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
+                self.boundary = np.clip(self.boundary, 0, 1)
+                return int(mask.sum())
         return 0
     
-    def run_with_burnin(self, burn_in: int = 200, measure_steps: int = 300) -> List[Dict]:
-        """
-        Run simulation with burn-in period before measurement.
-        
-        Args:
-            burn_in: Number of steps to run before measurement
-            measure_steps: Number of steps to measure
-            
-        Returns:
-            List of measurement dictionaries
-        """
-        # Burn-in phase (no measurement)
-        for t in range(burn_in):
-            self._step_internal(t, record=False)
-        
-        # Measurement phase
-        rows = []
-        for t in range(measure_steps):
-            rec = self._step_internal(burn_in + t, record=True)
-            rec['t'] = t  # Reset time to 0-based for measurements
-            rows.append(rec)
-        
-        return rows
-    
     def _step_internal(self, step: int, record: bool = True) -> Optional[Dict]:
-        """Internal step function with optional recording"""
-        self.step_agents()
-        self.boundary = self.coop_field()
-        self.update_bulk()
+        """
+        Fixed temporal ordering: measure λ → physics → apply gate → measure S
+        This ensures S(t) depends on λ(t-delay), not λ(t)
         
+        Critical ordering:
+        A. Measure pre-lambda (before updates)
+        B. Agent physics updates
+        C. Bulk update
+        D. HR with delayed c_eff
+        E. Apply pending gate (from delay queue)
+        F. Boundary updates (payoff, SOC)
+        G. Measure post-S_RT
+        H. Detect and enqueue new gate (for future)
+        I. Compute next c_eff (for next step)
+        """
+        
+        # ===== A. MEASURE PRE-LAMBDA (before any updates) =====
+        Lambda_b_pre = self.K_over_V(self.boundary)
+        
+        # Get region A for measurements
         R = self.region_A(step)
-        Lb_pre = self.K_over_V(self.boundary)
-        
         out_band = outer_boundary_band(R, 1)
         in_band = inner_boundary_band(R, 1)
         
-        # Pre-update measurements
-        lam_p99_out_pre = float(np.percentile(Lb_pre[out_band], 99)) if out_band.any() else np.nan
-        lam_p99_in_pre = float(np.percentile(Lb_pre[in_band], 99)) if in_band.any() else np.nan
+        lam_p99_out_pre = float(np.percentile(Lambda_b_pre[out_band], 99)) if out_band.any() else np.nan
+        lam_p99_in_pre = float(np.percentile(Lambda_b_pre[in_band], 99)) if in_band.any() else np.nan
         
-        # Dynamic coupling
-        medG = float(np.median(Lb_pre))
-        norm_tail = (lam_p99_out_pre / (medG + 1e-12) - 1.0) if out_band.any() else 0.0
-        norm_tail = float(np.clip(norm_tail, -0.5, 3.0))
-        c_eff = float(np.clip(self.c0 * (1.0 + self.gamma * norm_tail), self.c0, self.c_eff_max))
+        # ===== B. PHYSICS UPDATES (agents, resources) =====
+        self.step_agents()
+        self.boundary = self.coop_field()
         
-        # Apply updates
-        self.HR(c_eff)
-        applied_px = self.apply_pending_gate()
-        new_mask = self.compute_gate_mask(R, Lb_pre)
-        if new_mask is not None:
-            self.pending_masks[-1] = new_mask
+        # ===== C. BULK UPDATE (from previous boundary state) =====
+        self.update_bulk()
         
+        # ===== D. HOLOGRAPHIC RENORMALIZATION (use previous c_eff) =====
+        self.HR(self.c_eff_current)  # Use delayed c_eff!
+        
+        # ===== E. APPLY PENDING GATE (from delay queue) =====
+        gate_px = self._apply_pending_gate_exact()
+        
+        # ===== F. BOUNDARY UPDATES (payoff, SOC) =====
         self.update_boundary_payoff()
         self.SOC_tune()
+        
+        # ===== G. MEASURE POST-S_RT (after all updates) =====
+        S_mo, parts = self.S_RT_multiobjective(R)
+        
+        # ===== H. DETECT AND ENQUEUE NEW GATE (for future) =====
+        self._lambda_hist.append(lam_p99_out_pre)
+        if len(self._lambda_hist) >= self._win:
+            window = np.array(self._lambda_hist[-self._win:])
+            if self._detect_outlier_tukey(window):
+                new_mask = self._compute_gate_mask_exact(Lambda_b_pre, R)
+            else:
+                new_mask = None
+        else:
+            new_mask = None
+        
+        # Append to deque (automatically pops oldest if full)
+        self.pending_gates.append(new_mask)
+        
+        # ===== I. COMPUTE NEXT c_eff (for next step) =====
+        medG = float(np.median(Lambda_b_pre))
+        norm_tail = (lam_p99_out_pre / (medG + 1e-12) - 1.0) if out_band.any() else 0.0
+        norm_tail = float(np.clip(norm_tail, -0.5, 3.0))
+        self.c_eff_current = float(np.clip(
+            self.c0 * (1.0 + self.gamma * norm_tail), 
+            self.c0, 
+            self.c_eff_max
+        ))
         
         if not record:
             return None
         
-        # Post-update measurements
-        S_mo, parts = self.S_RT_multiobjective(R)
-        Lb_post = self.K_over_V(self.boundary)
-        lam_p99_out_post = float(np.percentile(Lb_post[out_band], 99)) if out_band.any() else np.nan
-        lam_p99_in_post = float(np.percentile(Lb_post[in_band], 99)) if in_band.any() else np.nan
+        # Debug logging every 25 steps
+        if step % 25 == 0:
+            queue_head = 'Y' if (len(self.pending_gates) > 0 and self.pending_gates[0] is not None) else 'N'
+            print(f"[t={step:03d}] λ_pre={lam_p99_out_pre:.3f} "
+                  f"S_RT={S_mo:.3f} queue_head={queue_head} c_eff={self.c_eff_current:.3f}")
         
         return dict(
             t=step,
@@ -485,15 +503,47 @@ class Automaton:
             region_A_curvature=parts["curvature"],
             lambda_p99_A_out_pre=lam_p99_out_pre,
             lambda_p99_A_in_pre=lam_p99_in_pre,
-            lambda_p99_A_out_post=lam_p99_out_post,
-            lambda_p99_A_in_post=lam_p99_in_post,
-            c_eff=c_eff,
-            gate_applied_px=int(applied_px)
+            lambda_p99_A_out_post=np.nan,  # Not measured to avoid confusion
+            lambda_p99_A_in_post=np.nan,
+            c_eff=self.c_eff_current,
+            gate_applied_px=int(gate_px)
         )
+    
+    def run_with_burnin(self, burn_in: int = 250, measure_steps: int = 300) -> List[Dict]:
+        """
+        Run simulation with burn-in period before measurement.
+        
+        Args:
+            burn_in: Number of steps to run before measurement (default 250)
+            measure_steps: Number of steps to measure (default 300)
+            
+        Returns:
+            List of measurement dictionaries
+        """
+        # Burn-in phase (no measurement)
+        print(f"[BURN-IN] Running {burn_in} steps...")
+        for t in range(burn_in):
+            self._step_internal(t, record=False)
+        
+        # Measurement phase
+        print(f"[MEASURE] Recording {measure_steps} steps...")
+        rows = []
+        for t in range(measure_steps):
+            rec = self._step_internal(burn_in + t, record=True)
+            rec['t'] = t  # Reset to 0-based for measurements
+            rows.append(rec)
+        
+        return rows
     
     def step_once(self, step: int, weights: Optional[Tuple[float, float, float]] = None) -> Dict:
         """
         Legacy interface: Execute one complete timestep.
         For compatibility with existing code.
         """
+        # Set weights if provided
+        if weights is not None:
+            self.rt_weights.WEIGHT_PERIMETER = weights[0]
+            self.rt_weights.WEIGHT_HOLES = weights[1]
+            self.rt_weights.WEIGHT_CURVATURE = weights[2]
+        
         return self._step_internal(step, record=True)
