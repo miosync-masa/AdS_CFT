@@ -506,7 +506,7 @@ class Automaton:
         # ===== 3. 記録（同時点測定値を使う！） =====
         if step % 25 == 0:
             print(f"[t={step:03d}] λ={lam_p99_out:.3f}  S_RT={S_mo:.3f}  "
-                  f"gate={gate_applied_px}  c_eff={self.c_eff_current:.3f}")
+                  f"gate={applied_pixels}  c_eff={self.c_eff_current:.3f}")
         
         return dict(
             t=step,
