@@ -402,21 +402,16 @@ class Automaton:
         )
     
     def _apply_pending_gate_exact(self) -> int:
-        """FIX: Apply gate with exact delay (no off-by-one)"""
-        if self.gate_delay <= 0:
+        """Apply gate with exact delay"""
+        if self.gate_delay <= 0 or len(self.pending_gates) == 0:
             return 0
         
-        mask = self.pending_gates.popleft()  # Exactly delay steps ago
+        mask = self.pending_gates.popleft()  # 取り出す（delay前のもの）
         if mask is not None and mask.any():
             self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
             self.boundary = np.clip(self.boundary, 0, 1)
-            applied = int(mask.sum())
-        else:
-            applied = 0
-        
-        # Advance queue
-        self.pending_gates.append(None)
-        return applied
+            return int(mask.sum())
+        return 0
     
     def _detect_outlier_enhanced(self, series_window: np.ndarray) -> bool:
         """Enhanced outlier detection"""
@@ -477,17 +472,22 @@ class Automaton:
             self.pending_gates[-1] = new_mask
         
         # H) Compute next c_eff (z-score amplification)
-        z = 0.0
-        if len(self._lambda_hist) >= 10:
-            arr = np.array(self._lambda_hist, dtype=float)
-            mu, sd = float(arr.mean()), float(arr.std() + 1e-12)
-            z = (lam_p99_out_pre - mu) / sd
+        self._lambda_hist.append(lam_p99_out_pre)
+        new_mask = None
+        if len(self._lambda_hist) == self._lambda_hist.maxlen:
+            window = np.array(self._lambda_hist)
+            if self._detect_outlier_enhanced(window) and out_band_pre.any():
+                vals = Lambda_b_pre[out_band_pre]
+                p98 = np.percentile(vals, 98)
+                cand = out_band_pre & (Lambda_b_pre >= p98)
+                new_mask = cand if cand.any() else None
         
-        self.c_eff_current = float(np.clip(
-            self.c0 * (1.0 + self.gamma * max(0.0, z)),
-            self.c0,
-            self.c_eff_max
-        ))
+        if self.gate_delay > 0:
+            # 多重発火抑制
+            if not any(m is not None for m in self.pending_gates):
+                self.pending_gates.append(new_mask)  # appendで追加！
+            else:
+                self.pending_gates.append(None)  # 空でも長さ維持
         
         # I) NOW update agents (AFTER boundary measurements)
         self.step_agents()
