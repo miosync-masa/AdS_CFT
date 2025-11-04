@@ -63,7 +63,7 @@ class Automaton:
         c_eff_max: float = 0.15,  # Reduced for zero-lag suppression
         # Gating params (legacy)
         gate_delay: int = 1,
-        gate_strength: float = 0.12,
+        gate_strength: float = 0.15,
         # SOC (legacy)
         soc_rate: float = 0.01,
         # Random seed
@@ -500,7 +500,8 @@ class Automaton:
                 new_mask = None
         else:
             new_mask = None
-        
+
+        self.pending_gates[-1] = new_mask
         # Don't append to deque here - popleft/append is handled in _apply_pending_gate_exact
         
         # ===== I. COMPUTE NEXT c_eff (PATCH 3: z-score amplification) =====
@@ -523,9 +524,10 @@ class Automaton:
         
         # Debug logging
         if step % 25 == 0:
-            queue_head = 'Y' if (len(self.pending_gates) > 0 and self.pending_gates[0] is not None) else 'N'
+            pending_has_gate = any(m is not None for m in self.pending_gates)
             print(f"[t={step:03d}] λ_pre={lam_p99_out_pre:.3f} "
-                  f"S_RT={S_mo:.3f} queue_head={queue_head} c_eff={self.c_eff_current:.3f}")
+                  f"S_RT={S_mo:.3f} queue={'Y' if pending_has_gate else 'N'} "
+                  f"c_eff={self.c_eff_current:.3f}")
         
         return dict(
             t=step,
