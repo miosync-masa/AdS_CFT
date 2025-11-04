@@ -7,6 +7,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from .automaton import Automaton
 from .plotters import plot_rt_timeseries, plot_crosscorr, plot_transfer_entropy
 from .metrics import spearman_corr
@@ -140,6 +141,83 @@ def run_experiment(args):
         print(f"  ⚠ PARTIAL: Positive lag but weak correlation (ρ={rho_s:.3f})")
     else:
         print(f"  ✗ FAIL: No causal lag detected")
+    
+    import matplotlib.pyplot as plt
+    
+    # 詳細な相関プロット
+    print("[DEBUG] Generating detailed correlation analysis...")
+    lags = np.arange(-50, 51)
+    corrs = []
+    for lag in lags:
+        try:
+            if lag >= 0:
+                a = df['lambda_p99_A_out_pre'].values[lag:]
+                b = df['entropy_RT_mo'].values[:len(df)-lag]
+            else:
+                a = df['lambda_p99_A_out_pre'].values[:lag]
+                b = df['entropy_RT_mo'].values[-lag:]
+            
+            if len(a) > 10:  # 十分なデータがある場合のみ
+                corr = np.corrcoef(a, b)[0, 1]
+                corrs.append(corr)
+            else:
+                corrs.append(np.nan)
+        except:
+            corrs.append(np.nan)
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(lags, corrs, 'b-', linewidth=2)
+    plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+    plt.axvline(x=0, color='k', linestyle='-', alpha=0.3)
+    plt.axvline(x=best_lag, color='r', linestyle='--', alpha=0.7, label=f'Best lag={best_lag}')
+    plt.xlabel('Lag (steps)')
+    plt.ylabel('Pearson Correlation')
+    plt.title(f'Cross-correlation: λ_p99(t) vs S_RT(t+lag)\nBest: {best_corr:.3f} at lag {best_lag}')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    
+    debug_plot_path = os.path.join(args.outdir, "debug_correlation.png")
+    plt.savefig(debug_plot_path, dpi=150)
+    plt.close()
+    print(f"[DEBUG] Saved correlation plot to {debug_plot_path}")
+    
+    # λとS_RTの時系列を並べて表示
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8))
+    
+    # λの時系列
+    axes[0].plot(df['t'], df['lambda_p99_A_out_pre'], 'b-', alpha=0.7)
+    axes[0].set_ylabel('λ_p99')
+    axes[0].set_title('Lambda p99 (outer band, pre)')
+    axes[0].grid(True, alpha=0.3)
+    
+    # S_RTの時系列
+    axes[1].plot(df['t'], df['entropy_RT_mo'], 'r-', alpha=0.7)
+    axes[1].set_ylabel('S_RT')
+    axes[1].set_title('RT Entropy (multi-objective)')
+    axes[1].grid(True, alpha=0.3)
+    
+    # ゲート適用のタイミング
+    axes[2].plot(df['t'], df['gate_applied_px'], 'g-', alpha=0.7)
+    axes[2].set_ylabel('Gate pixels')
+    axes[2].set_xlabel('Time step')
+    axes[2].set_title('Gate application timing')
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    debug_ts_path = os.path.join(args.outdir, "debug_timeseries.png")
+    plt.savefig(debug_ts_path, dpi=150)
+    plt.close()
+    print(f"[DEBUG] Saved timeseries plot to {debug_ts_path}")
+    
+    # 統計情報を出力
+    print("\n[DEBUG] Statistics:")
+    print(f"  λ_p99 mean: {df['lambda_p99_A_out_pre'].mean():.3f}")
+    print(f"  λ_p99 std: {df['lambda_p99_A_out_pre'].std():.3f}")
+    print(f"  S_RT mean: {df['entropy_RT_mo'].mean():.3f}")
+    print(f"  S_RT std: {df['entropy_RT_mo'].std():.3f}")
+    print(f"  Gate applications: {(df['gate_applied_px'] > 0).sum()} times")
+    print(f"  c_eff range: [{df['c_eff'].min():.3f}, {df['c_eff'].max():.3f}]")
     
     return metadata
 
