@@ -472,10 +472,11 @@ class Automaton:
                 cand = out_band_pre & (Lambda_b_pre >= p98)
                 new_mask = cand if cand.any() else None
         
-        # ★シンプルなエンキュー（最後尾を上書き）★
+        # ★修正：dequeをリストに変換してチェック★
         if self.gate_delay > 0 and len(self.pending_gates) > 0:
-            # 多重発火抑制：既にキューに何か入ってたらnew_maskを捨てる
-            if new_mask is not None and any(m is not None for m in self.pending_gates[:-1]):
+            # 多重発火抑制：既にキューに何か入ってたら新規追加しない
+            has_pending = any(m is not None for m in list(self.pending_gates))
+            if new_mask is not None and has_pending:
                 new_mask = None
             self.pending_gates[-1] = new_mask  # 最後尾を上書き
         
