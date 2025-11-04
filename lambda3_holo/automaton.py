@@ -1,3 +1,7 @@
+"""
+lambda3_holo/automaton.py
+"""
+
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Union
@@ -8,6 +12,19 @@ from .geometry import (
 )
 from .config import ModelConfig, AgentDynamics, ResourceDynamics, AdSCFTParams, GeodesicGating, RTWeights
 
+# ========== グローバルRNG管理 ==========
+_global_rng = None
+
+def set_global_seed(seed: int):
+    """グローバルRNGのseedを設定"""
+    global _global_rng
+    _global_rng = np.random.default_rng(seed)
+    return _global_rng
+
+# デフォルトは913（PhaseShift-IXbの実験値）
+rng = set_global_seed(913)
+
+# ========== データクラス ==========
 @dataclass
 class Cell:
     alive: bool
@@ -15,15 +32,30 @@ class Cell:
     genome: np.ndarray
     coop: float
 
-def _rng(seed: int):
-    return np.random.default_rng(seed)
+# ========== 外部関数（RNG順序保持のため超重要） ==========
+def init_grid(H=44, W=44, G=56) -> List[List[Cell]]:
+    """外部関数：グローバルRNGを使用してグリッドを初期化"""
+    grid = []
+    for i in range(H):
+        row = []
+        for j in range(W):
+            row.append(Cell(
+                alive=True,
+                energy=float(1.0 + 0.2 * _global_rng.standard_normal()),
+                genome=_global_rng.integers(0, 2, size=G, dtype=np.int8),
+                coop=float(np.clip(0.5 + 0.2 * _global_rng.standard_normal(), 0, 1))
+            ))
+        grid.append(row)
+    return grid
 
-def mutate(genome: np.ndarray, mut_rate: float, rng) -> np.ndarray:
+def mutate(genome: np.ndarray, mut_rate: float) -> np.ndarray:
+    """外部関数：グローバルRNGを使用してゲノムを変異"""
     g = genome.copy()
-    flips = rng.random(len(g)) < mut_rate
+    flips = _global_rng.random(len(g)) < mut_rate
     g[flips] = 1 - g[flips]
     return g
 
+# ========== メインクラス ==========
 class Automaton:
     """
     AdS/CFT-aware self-evolving automaton with HR and delayed geodesic gating.
@@ -74,6 +106,8 @@ class Automaton:
             seed: Random seed
         """
         
+        # グローバルRNGのseed設定
+        global rng
         if config is not None:
             # Use config object
             self.H = config.H
@@ -84,7 +118,8 @@ class Automaton:
             self.ads_cft = config.ads_cft
             self.gating = config.gating
             self.rt_weights = config.rt_weights
-            self.rng = _rng(config.seed)
+            # configからseed設定
+            rng = set_global_seed(config.seed)
         else:
             # Legacy: construct from individual params
             self.H = H
@@ -104,7 +139,8 @@ class Automaton:
                 GATE_STRENGTH=gate_strength
             )
             self.rt_weights = RTWeights()
-            self.rng = _rng(seed)
+            # legacyパラメータからseed設定
+            rng = set_global_seed(seed)
         
         # Shortcuts for frequently used values
         self.L_ads = self.ads_cft.L_ADS
@@ -117,43 +153,29 @@ class Automaton:
         self.soc_rate = self.ads_cft.SOC_RATE
         self.G_N = self.ads_cft.G_N
         
-        # Initialize state
-        self.grid = self._init_grid(self.H, self.W, G=56)
+        # Initialize state（外部関数を使用）
+        self.grid = init_grid(self.H, self.W, 56)
         self.resource = np.ones((self.H, self.W), dtype=float)
+        
+        # Add spatial seeds (checkerboard + Gaussian)
+        for i in range(self.H):
+            for j in range(self.W):
+                if ((i // 4 + j // 4) % 2) == 0:
+                    self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 1.25, 0, 1))
+                else:
+                    self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 0.75, 0, 1))
+        
+        cy, cx = self.H // 2, self.W // 2
+        for i in range(self.H):
+            for j in range(self.W):
+                r2 = (i - cy)**2 + (j - cx)**2
+                boost = np.exp(-r2 / (self.H / 4)**2)
+                self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * (1 + 0.4 * boost), 0, 1))
+        
+        # Initialize boundary and bulk
         self.boundary = self.coop_field()
         self.bulk = np.zeros((self.H, self.W, self.Z), dtype=float)
         self.pending_masks: List[Optional[np.ndarray]] = [None] * (self.gate_delay + 1)
-
-    # ---------- init ----------
-    def _init_grid(self, H: int, W: int, G: int) -> List[List[Cell]]:
-        grid = []
-        for i in range(H):
-            row = []
-            for j in range(W):
-                row.append(Cell(
-                    alive=True,
-                    energy=float(1.0 + 0.2 * self.rng.standard_normal()),
-                    genome=self.rng.integers(0, 2, size=G, dtype=np.int8),
-                    coop=float(np.clip(0.5 + 0.2 * self.rng.standard_normal(), 0, 1))
-                ))
-            grid.append(row)
-        
-        # Add spatial seeds (checkerboard + Gaussian)
-        for i in range(H):
-            for j in range(W):
-                if ((i // 4 + j // 4) % 2) == 0:
-                    grid[i][j].coop = float(np.clip(grid[i][j].coop * 1.25, 0, 1))
-                else:
-                    grid[i][j].coop = float(np.clip(grid[i][j].coop * 0.75, 0, 1))
-        
-        cy, cx = H // 2, W // 2
-        for i in range(H):
-            for j in range(W):
-                r2 = (i - cy)**2 + (j - cx)**2
-                boost = np.exp(-r2 / (H / 4)**2)
-                grid[i][j].coop = float(np.clip(grid[i][j].coop * (1 + 0.4 * boost), 0, 1))
-        
-        return grid
 
     # ---------- fields ----------
     def coop_field(self) -> np.ndarray:
@@ -208,12 +230,12 @@ class Automaton:
                     self.grid[i][(j - 1) % W].energy += q
                     c.energy -= give
                 
-                # Update cooperation
+                # Update cooperation (グローバルRNG使用)
                 neigh = 0.25 * (
                     C[(i + 1) % H][j] + C[(i - 1) % H][j] +
                     C[i][(j + 1) % W] + C[i][(j - 1) % W]
                 )
-                c.coop += coop_update_rate * (neigh - c.coop) + thermal_noise * self.rng.standard_normal()
+                c.coop += coop_update_rate * (neigh - c.coop) + thermal_noise * _global_rng.standard_normal()
                 c.coop = float(np.clip(c.coop, 0, 1))
                 
                 # Death
@@ -221,17 +243,17 @@ class Automaton:
                     c.alive = False
                     c.coop = 0.0
                 
-                # Birth
-                elif c.energy > birth_threshold and self.rng.random() < birth_prob:
+                # Birth (グローバルRNG使用)
+                elif c.energy > birth_threshold and _global_rng.random() < birth_prob:
                     child = Cell(
                         True,
                         c.energy * 0.5,
-                        mutate(c.genome, mutation_rate, self.rng),
+                        mutate(c.genome, mutation_rate),  # 外部関数、引数にrng不要
                         c.coop
                     )
                     c.energy *= 0.5
-                    ii = (i + self.rng.integers(-1, 2)) % H
-                    jj = (j + self.rng.integers(-1, 2)) % W
+                    ii = (i + _global_rng.integers(-1, 2)) % H
+                    jj = (j + _global_rng.integers(-1, 2)) % W
                     self.grid[ii][jj] = child
         
         # Resource dynamics
@@ -380,7 +402,7 @@ class Automaton:
             )
         
         self.step_agents()
-        self.boundary = self.coop_field()
+        self.boundary = self.coop_field()  # 重要：これは必要！
         self.update_bulk()
 
         R = self.region_A(step)
