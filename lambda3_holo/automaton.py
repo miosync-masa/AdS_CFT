@@ -126,7 +126,7 @@ class Automaton:
         
         # SOC rates for different phases (CRITICAL!)
         self.soc_rate_burnin = 0.01      # Normal during burn-in
-        self.soc_rate_measure = 0.001    # Reduced during measurement!
+        self.soc_rate_measure = 0.0      # ★完全OFF during measurement!
         self.phase = 'init'              # Track current phase
         
         # Initialize independent RNG streams
@@ -176,33 +176,6 @@ class Automaton:
                 boost = np.exp(-r2 / (H / 4)**2)
                 self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * (1 + 0.4 * boost), 0, 1))
     
-    def _apply_spatial_seed(self):
-        """Add extra spatial roughness to prevent λ=1 lock-in"""
-        H, W = self.H, self.W
-        B = self.boundary
-        
-        # Enhanced checkerboard pattern (3x3 blocks for more variation)
-        for i in range(H):
-            for j in range(W):
-                if ((i // 3 + j // 3) & 1) == 0:
-                    B[i, j] = np.clip(B[i, j] * 1.25 + 0.02, 0, 1)
-                else:
-                    B[i, j] = np.clip(B[i, j] * 0.75 - 0.02, 0, 1)
-        
-        # Stronger Gaussian bump at center
-        cy, cx = H // 2, W // 2
-        for i in range(H):
-            for j in range(W):
-                r2 = (i - cy)**2 + (j - cx)**2
-                bump = np.exp(-r2 / (H / 4)**2)
-                B[i, j] = np.clip(B[i, j] + 0.15 * bump, 0, 1)
-        
-        # Add random noise for initial diversity
-        noise = self.rng_init.uniform(-0.05, 0.05, (H, W))
-        B[:] = np.clip(B + noise, 0, 1)
-        
-        self.boundary = B
-
     def coop_field(self) -> np.ndarray:
         """Extract cooperation field from agent grid"""
         M = np.zeros((self.H, self.W), dtype=float)
@@ -421,28 +394,28 @@ class Automaton:
         self._apply_spatial_seed()
     
     def _apply_spatial_seed(self):
-        """Add extra spatial roughness to prevent λ=1 lock-in"""
+        """Add EXTREME spatial roughness to break λ=1 lock-in"""
         H, W = self.H, self.W
         B = self.boundary
         
-        # Enhanced checkerboard pattern (3x3 blocks for more variation)
+        # もっと激しいチェッカーボード（2x2ブロック）
         for i in range(H):
             for j in range(W):
-                if ((i // 3 + j // 3) & 1) == 0:
-                    B[i, j] = np.clip(B[i, j] * 1.25 + 0.02, 0, 1)
+                if ((i // 2 + j // 2) & 1) == 0:
+                    B[i, j] = np.clip(B[i, j] * 1.5 + 0.1, 0, 1)  # 強化！
                 else:
-                    B[i, j] = np.clip(B[i, j] * 0.75 - 0.02, 0, 1)
+                    B[i, j] = np.clip(B[i, j] * 0.5 - 0.1, 0, 1)  # 強化！
         
-        # Stronger Gaussian bump at center
+        # もっと強いガウシアンバンプ
         cy, cx = H // 2, W // 2
         for i in range(H):
             for j in range(W):
                 r2 = (i - cy)**2 + (j - cx)**2
-                bump = np.exp(-r2 / (H / 4)**2)
-                B[i, j] = np.clip(B[i, j] + 0.15 * bump, 0, 1)
+                bump = np.exp(-r2 / (H / 6)**2)  # 狭くして鋭く！
+                B[i, j] = np.clip(B[i, j] + 0.3 * bump, 0, 1)  # 0.15→0.3
         
-        # Add random noise for initial diversity
-        noise = self.rng_init.uniform(-0.05, 0.05, (H, W))
+        # もっと強いノイズ
+        noise = self.rng_init.uniform(-0.1, 0.1, (H, W))  # 0.05→0.1
         B[:] = np.clip(B + noise, 0, 1)
         
         self.boundary = B
@@ -460,6 +433,10 @@ class Automaton:
         """Self-organized criticality with phase-aware rate"""
         # Use different rates for burn-in vs measurement
         rate = self.soc_rate_burnin if self.phase == 'burnin' else self.soc_rate_measure
+        
+        # ★測定フェーズではスキップ！
+        if rate == 0.0:
+            return  # Do nothing during measurement
         
         Lb = self.K_over_V(self.coop_field())
         delta = float(Lb.mean() - self.ads_cft.LAMBDA_CRITICAL)
