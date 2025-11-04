@@ -1,10 +1,11 @@
 """
-lambda3_holo/automaton.py
+lambda3_holo/automaton.py - Fully reproducible AdS/CFT automaton with RNG separation
 """
 
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Union
+from numpy.random import Generator, PCG64, SeedSequence
 
 from .geometry import (
     laplacian2d, perimeter_len_bool8, corner_count, count_holes_nonperiodic,
@@ -12,65 +13,35 @@ from .geometry import (
 )
 from .config import ModelConfig, AgentDynamics, ResourceDynamics, AdSCFTParams, GeodesicGating, RTWeights
 
-# ========== グローバルRNG管理 ==========
-_global_rng = None
+# ========== RNG Utilities ==========
+def make_rng(seed: int, stream_tag: str) -> Generator:
+    """
+    Create an independent RNG stream from seed and tag.
+    Ensures complete independence across subsystems.
+    """
+    ss = SeedSequence(seed, spawn_key=[hash(stream_tag) & 0xffffffff])
+    return Generator(PCG64(ss))
 
-def set_global_seed(seed: int):
-    """グローバルRNGのseedを設定"""
-    global _global_rng
-    _global_rng = np.random.default_rng(seed)
-    return _global_rng
-
-# デフォルトは913（PhaseShift-IXbの実験値）
-rng = set_global_seed(913)
-
-# ========== データクラス ==========
+# ========== Data Classes ==========
 @dataclass
 class Cell:
+    """Agent cell with energy, genome, and cooperation level"""
     alive: bool
     energy: float
     genome: np.ndarray
     coop: float
 
-# ========== 外部関数（RNG順序保持のため超重要） ==========
-def init_grid(H=44, W=44, G=56) -> List[List[Cell]]:
-    """外部関数：グローバルRNGを使用してグリッドを初期化"""
-    grid = []
-    for i in range(H):
-        row = []
-        for j in range(W):
-            row.append(Cell(
-                alive=True,
-                energy=float(1.0 + 0.2 * _global_rng.standard_normal()),
-                genome=_global_rng.integers(0, 2, size=G, dtype=np.int8),
-                coop=float(np.clip(0.5 + 0.2 * _global_rng.standard_normal(), 0, 1))
-            ))
-        grid.append(row)
-    return grid
-
-def mutate(genome: np.ndarray, mut_rate: float) -> np.ndarray:
-    """外部関数：グローバルRNGを使用してゲノムを変異"""
-    g = genome.copy()
-    flips = _global_rng.random(len(g)) < mut_rate
-    g[flips] = 1 - g[flips]
-    return g
-
-# ========== メインクラス ==========
+# ========== Main Automaton Class ==========
 class Automaton:
     """
-    AdS/CFT-aware self-evolving automaton with HR and delayed geodesic gating.
+    AdS/CFT-aware self-evolving automaton with holographic renormalization
+    and delayed geodesic gating. Fully reproducible with RNG stream separation.
     
-    Can be initialized either with:
-    1. A ModelConfig object (recommended)
-    2. Individual parameters (legacy compatibility)
-    
-    Examples:
-        # With config
-        >>> from lambda3_holo.config import config_phaseshift_ixb
-        >>> ua = Automaton(config=config_phaseshift_ixb())
-        
-        # With individual params (legacy)
-        >>> ua = Automaton(H=44, W=44, gate_delay=1)
+    Key features:
+    - Complete RNG independence between subsystems
+    - Full state reset capability
+    - Burn-in period support
+    - Deterministic geodesic gating
     """
     
     def __init__(
@@ -95,19 +66,18 @@ class Automaton:
         seed: int = 913
     ):
         """
-        Initialize automaton.
+        Initialize automaton with either ModelConfig or individual parameters.
         
         Args:
-            config: Complete ModelConfig (if provided, overrides all other params)
-            H, W, Z: Grid dimensions (only used if config=None)
-            L_ads, alpha, c0, gamma, c_eff_max: AdS/CFT params (legacy)
-            gate_delay, gate_strength: Gating params (legacy)
-            soc_rate: SOC tuning rate (legacy)
-            seed: Random seed
+            config: Complete ModelConfig object (overrides all other params)
+            H, W, Z: Grid dimensions
+            seed: Random seed for reproducibility
         """
         
-        # グローバルRNGのseed設定
-        global rng
+        # Store seed for reproducibility
+        self.seed = seed
+        
+        # Parse configuration
         if config is not None:
             # Use config object
             self.H = config.H
@@ -118,8 +88,7 @@ class Automaton:
             self.ads_cft = config.ads_cft
             self.gating = config.gating
             self.rt_weights = config.rt_weights
-            # configからseed設定
-            rng = set_global_seed(config.seed)
+            self.seed = config.seed
         else:
             # Legacy: construct from individual params
             self.H = H
@@ -139,8 +108,6 @@ class Automaton:
                 GATE_STRENGTH=gate_strength
             )
             self.rt_weights = RTWeights()
-            # legacyパラメータからseed設定
-            rng = set_global_seed(seed)
         
         # Shortcuts for frequently used values
         self.L_ads = self.ads_cft.L_ADS
@@ -153,53 +120,108 @@ class Automaton:
         self.soc_rate = self.ads_cft.SOC_RATE
         self.G_N = self.ads_cft.G_N
         
-        # Initialize state（外部関数を使用）
-        self.grid = init_grid(self.H, self.W, 56)
-        self.resource = np.ones((self.H, self.W), dtype=float)
+        # Initialize independent RNG streams
+        self.rng_core = make_rng(self.seed, "core")      # Agent dynamics
+        self.rng_gate = make_rng(self.seed, "gate")      # Gating decisions
+        self.rng_noise = make_rng(self.seed, "noise")    # Thermal noise
+        self.rng_init = make_rng(self.seed, "init")      # Initialization
         
-        # Add spatial seeds (checkerboard + Gaussian)
+        # Full state reset
+        self.reset_state()
+    
+    def reset_state(self):
+        """
+        Complete state reset to ensure reproducibility.
+        Clears all hidden states and reinitializes from scratch.
+        """
+        H, W, Z = self.H, self.W, self.Z
+        
+        # Clear all arrays
+        self.bulk = np.zeros((H, W, Z), dtype=float)
+        self.boundary = np.zeros((H, W), dtype=float)
+        self.resource = np.ones((H, W), dtype=float)
+        
+        # CRITICAL: Clear pending gates queue
+        self.pending_masks = [None] * (self.gate_delay + 1)
+        
+        # Clear cached values
+        self.last_region_A = None
+        self.hr_weights = None
+        
+        # Initialize grid with deterministic RNG
+        self.grid = self._init_grid()
+        
+        # Apply spatial patterns
+        self._apply_spatial_pattern()
+        
+        # Initialize boundary from cooperation field
+        self.boundary = self.coop_field()
+    
+    def _init_grid(self) -> List[List[Cell]]:
+        """
+        Initialize agent grid using dedicated init RNG stream.
+        Ensures reproducibility across runs with same seed.
+        """
+        grid = []
         for i in range(self.H):
+            row = []
             for j in range(self.W):
+                row.append(Cell(
+                    alive=True,
+                    energy=float(1.0 + 0.2 * self.rng_init.standard_normal()),
+                    genome=self.rng_init.integers(0, 2, size=56, dtype=np.int8),
+                    coop=float(np.clip(0.5 + 0.2 * self.rng_init.standard_normal(), 0, 1))
+                ))
+            grid.append(row)
+        return grid
+    
+    def _apply_spatial_pattern(self):
+        """Apply deterministic spatial patterns (checkerboard + Gaussian)"""
+        H, W = self.H, self.W
+        
+        # Checkerboard pattern
+        for i in range(H):
+            for j in range(W):
                 if ((i // 4 + j // 4) % 2) == 0:
                     self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 1.25, 0, 1))
                 else:
                     self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 0.75, 0, 1))
         
-        cy, cx = self.H // 2, self.W // 2
-        for i in range(self.H):
-            for j in range(self.W):
+        # Gaussian boost at center
+        cy, cx = H // 2, W // 2
+        for i in range(H):
+            for j in range(W):
                 r2 = (i - cy)**2 + (j - cx)**2
-                boost = np.exp(-r2 / (self.H / 4)**2)
+                boost = np.exp(-r2 / (H / 4)**2)
                 self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * (1 + 0.4 * boost), 0, 1))
-        
-        # Initialize boundary and bulk
-        self.boundary = self.coop_field()
-        self.bulk = np.zeros((self.H, self.W, self.Z), dtype=float)
-        self.pending_masks: List[Optional[np.ndarray]] = [None] * (self.gate_delay + 1)
-
-    # ---------- fields ----------
+    
     def coop_field(self) -> np.ndarray:
+        """Extract cooperation field from agent grid"""
         M = np.zeros((self.H, self.W), dtype=float)
         for i in range(self.H):
             for j in range(self.W):
                 if self.grid[i][j].alive:
                     M[i, j] = self.grid[i][j].coop
         return M
-
+    
     def K_over_V(self, B: np.ndarray) -> np.ndarray:
+        """Compute Lambda = K/V field (kinetic/potential energy ratio)"""
         coop = np.clip(B, 0, 1)
         gx = np.roll(coop, -1, 1) - coop
         gy = np.roll(coop, -1, 0) - coop
         K = np.sqrt(gx * gx + gy * gy) + 1e-12
         V = np.abs(coop - float(coop.mean())) + 1e-12
         return K / V
-
-    # ---------- dynamics ----------
+    
     def step_agents(self):
+        """
+        Update agent dynamics using dedicated RNG streams.
+        Ensures complete reproducibility with seed.
+        """
         H, W = self.H, self.W
         C = self.coop_field()
         
-        # Use config values instead of hardcoded constants
+        # Get config values
         harvest_rate = self.agent.HARVEST_RATE
         share_rate = self.agent.SHARE_RATE
         coop_update_rate = self.agent.COOP_UPDATE_RATE
@@ -215,12 +237,12 @@ class Automaton:
                 if not c.alive:
                     continue
                 
-                # Harvest
+                # Harvest resources
                 take = min(harvest_rate, self.resource[i, j])
                 self.resource[i, j] -= take
                 c.energy += take
                 
-                # Share
+                # Share with neighbors
                 give = min(share_rate * c.coop, c.energy)
                 if give > 0:
                     q = 0.25 * give
@@ -230,38 +252,47 @@ class Automaton:
                     self.grid[i][(j - 1) % W].energy += q
                     c.energy -= give
                 
-                # Update cooperation (グローバルRNG使用)
+                # Update cooperation (use noise RNG)
                 neigh = 0.25 * (
                     C[(i + 1) % H][j] + C[(i - 1) % H][j] +
                     C[i][(j + 1) % W] + C[i][(j - 1) % W]
                 )
-                c.coop += coop_update_rate * (neigh - c.coop) + thermal_noise * _global_rng.standard_normal()
+                c.coop += coop_update_rate * (neigh - c.coop) 
+                c.coop += thermal_noise * self.rng_noise.standard_normal()
                 c.coop = float(np.clip(c.coop, 0, 1))
                 
-                # Death
+                # Death check
                 if c.energy < death_threshold:
                     c.alive = False
                     c.coop = 0.0
                 
-                # Birth (グローバルRNG使用)
-                elif c.energy > birth_threshold and _global_rng.random() < birth_prob:
+                # Birth (use core RNG)
+                elif c.energy > birth_threshold and self.rng_core.random() < birth_prob:
                     child = Cell(
                         True,
                         c.energy * 0.5,
-                        mutate(c.genome, mutation_rate),  # 外部関数、引数にrng不要
+                        self._mutate(c.genome, mutation_rate),
                         c.coop
                     )
                     c.energy *= 0.5
-                    ii = (i + _global_rng.integers(-1, 2)) % H
-                    jj = (j + _global_rng.integers(-1, 2)) % W
+                    ii = (i + self.rng_core.integers(-1, 2)) % H
+                    jj = (j + self.rng_core.integers(-1, 2)) % W
                     self.grid[ii][jj] = child
         
-        # Resource dynamics
+        # Update resource field
         self.resource += self.resource_config.RESOURCE_DIFFUSION * laplacian2d(self.resource)
         self.resource += self.resource_config.RESOURCE_REPLENISH
         self.resource = np.clip(self.resource, 0, self.resource_config.RESOURCE_MAX)
-
+    
+    def _mutate(self, genome: np.ndarray, mut_rate: float) -> np.ndarray:
+        """Mutate genome using core RNG"""
+        g = genome.copy()
+        flips = self.rng_core.random(len(g)) < mut_rate
+        g[flips] = 1 - g[flips]
+        return g
+    
     def update_bulk(self):
+        """Update bulk Lambda field with AdS warping"""
         L0 = self.K_over_V(self.boundary)
         self.bulk[..., 0] = L0
         dz = 1.0 / self.Z
@@ -272,8 +303,9 @@ class Automaton:
             prev = self.bulk[..., k - 1]
             mixed = prev + self.ads_cft.BULK_DIFFUSION * laplacian2d(prev)
             self.bulk[..., k] = np.clip(warp * mixed, 0, None)
-
+    
     def HR(self, c_eff: float):
+        """Holographic renormalization: bulk → boundary feedback"""
         dz = 1.0 / self.Z
         z = (np.arange(self.Z) + 1) * dz
         w = np.exp(-self.alpha * z)
@@ -281,8 +313,9 @@ class Automaton:
         back = np.tensordot(self.bulk, w, axes=(2, 0))
         self.boundary += c_eff * (back - self.boundary)
         self.boundary = np.clip(self.boundary, 0, 1)
-
+    
     def update_boundary_payoff(self):
+        """Update boundary via game-theoretic payoff"""
         B = self.boundary
         neigh = 0.25 * (
             np.roll(B, 1, 0) + np.roll(B, -1, 0) +
@@ -291,14 +324,15 @@ class Automaton:
         payoff = neigh * (1.4 - 0.6 * B) - 0.4 * B * (1 - neigh)
         self.boundary += self.ads_cft.BOUNDARY_PAYOFF_RATE * payoff
         self.boundary = np.clip(self.boundary, 0, 1)
-
+    
     def SOC_tune(self):
+        """Self-organized criticality: tune toward Lambda=1"""
         Lb = self.K_over_V(self.coop_field())
         delta = float(Lb.mean() - self.ads_cft.LAMBDA_CRITICAL)
         self.boundary = np.clip(self.boundary - self.soc_rate * delta, 0, 1)
-
-    # ---------- geometry (A region) ----------
+    
     def region_A(self, step: int) -> np.ndarray:
+        """Define region A for RT entropy calculation"""
         C = self.coop_field()
         alive = C > 0
         if alive.sum() == 0:
@@ -307,12 +341,12 @@ class Automaton:
             return R
         thr = float(np.median(C[alive]))
         high = C >= thr
-        k = 0 if (step % 2 == 0) else 1  # alternate largest/second largest
+        k = 0 if (step % 2 == 0) else 1  # Alternate between largest/second
         R = k_th_largest_mask(high, k)
         if R.sum() == 0:
             R = k_th_largest_mask(high, 0)
         return R
-
+    
     def S_RT_multiobjective(
         self,
         R: np.ndarray,
@@ -322,12 +356,7 @@ class Automaton:
     ) -> Tuple[float, Dict[str, float]]:
         """
         Compute multi-objective RT entropy.
-        
-        Args:
-            R: Region mask
-            w_len: Perimeter weight (default: from config)
-            w_hole: Hole weight (default: from config)
-            w_curv: Curvature weight (default: from config)
+        S = (w_len*perimeter + w_hole*holes + w_curv*curvature) / (4*G_N)
         """
         if w_len is None:
             w_len = self.rt_weights.WEIGHT_PERIMETER
@@ -346,9 +375,12 @@ class Automaton:
             holes=float(holes),
             curvature=float(curv)
         )
-
-    # ---------- geodesic gating ----------
+    
     def compute_gate_mask(self, R: np.ndarray, Lb_pre: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Detect outliers and create gate mask using gate RNG.
+        Uses Tukey's outlier detection (IQR method).
+        """
         out = outer_boundary_band(R, 1)
         if not out.any():
             return None
@@ -364,8 +396,9 @@ class Automaton:
         if lam_p99 > thresh:
             return out.copy()
         return None
-
+    
     def apply_pending_gate(self) -> int:
+        """Apply delayed geodesic gate from queue"""
         mask = self.pending_masks.pop(0)
         self.pending_masks.append(None)
         if mask is not None and mask.any():
@@ -377,62 +410,72 @@ class Automaton:
             self.boundary = B
             return int(mask.sum())
         return 0
-
-    # ---------- one step (manual to expose pre/post) ----------
-    def step_once(
-        self,
-        step: int,
-        weights: Optional[Tuple[float, float, float]] = None
-    ) -> Dict:
+    
+    def run_with_burnin(self, burn_in: int = 200, measure_steps: int = 300) -> List[Dict]:
         """
-        Execute one complete timestep.
+        Run simulation with burn-in period before measurement.
         
         Args:
-            step: Current timestep number
-            weights: Optional (w_len, w_hole, w_curv) tuple
-        
+            burn_in: Number of steps to run before measurement
+            measure_steps: Number of steps to measure
+            
         Returns:
-            Dictionary of observables including pre/post λ values
+            List of measurement dictionaries
         """
-        if weights is None:
-            weights = (
-                self.rt_weights.WEIGHT_PERIMETER,
-                self.rt_weights.WEIGHT_HOLES,
-                self.rt_weights.WEIGHT_CURVATURE
-            )
+        # Burn-in phase (no measurement)
+        for t in range(burn_in):
+            self._step_internal(t, record=False)
         
+        # Measurement phase
+        rows = []
+        for t in range(measure_steps):
+            rec = self._step_internal(burn_in + t, record=True)
+            rec['t'] = t  # Reset time to 0-based for measurements
+            rows.append(rec)
+        
+        return rows
+    
+    def _step_internal(self, step: int, record: bool = True) -> Optional[Dict]:
+        """Internal step function with optional recording"""
         self.step_agents()
-        self.boundary = self.coop_field()  # 重要：これは必要！
+        self.boundary = self.coop_field()
         self.update_bulk()
-
+        
         R = self.region_A(step)
         Lb_pre = self.K_over_V(self.boundary)
-
+        
         out_band = outer_boundary_band(R, 1)
         in_band = inner_boundary_band(R, 1)
-
+        
+        # Pre-update measurements
         lam_p99_out_pre = float(np.percentile(Lb_pre[out_band], 99)) if out_band.any() else np.nan
         lam_p99_in_pre = float(np.percentile(Lb_pre[in_band], 99)) if in_band.any() else np.nan
-
+        
+        # Dynamic coupling
         medG = float(np.median(Lb_pre))
         norm_tail = (lam_p99_out_pre / (medG + 1e-12) - 1.0) if out_band.any() else 0.0
         norm_tail = float(np.clip(norm_tail, -0.5, 3.0))
         c_eff = float(np.clip(self.c0 * (1.0 + self.gamma * norm_tail), self.c0, self.c_eff_max))
-
+        
+        # Apply updates
         self.HR(c_eff)
         applied_px = self.apply_pending_gate()
         new_mask = self.compute_gate_mask(R, Lb_pre)
         if new_mask is not None:
             self.pending_masks[-1] = new_mask
-
+        
         self.update_boundary_payoff()
         self.SOC_tune()
-
-        S_mo, parts = self.S_RT_multiobjective(R, *weights)
+        
+        if not record:
+            return None
+        
+        # Post-update measurements
+        S_mo, parts = self.S_RT_multiobjective(R)
         Lb_post = self.K_over_V(self.boundary)
         lam_p99_out_post = float(np.percentile(Lb_post[out_band], 99)) if out_band.any() else np.nan
         lam_p99_in_post = float(np.percentile(Lb_post[in_band], 99)) if in_band.any() else np.nan
-
+        
         return dict(
             t=step,
             entropy_RT_mo=S_mo,
@@ -447,3 +490,10 @@ class Automaton:
             c_eff=c_eff,
             gate_applied_px=int(applied_px)
         )
+    
+    def step_once(self, step: int, weights: Optional[Tuple[float, float, float]] = None) -> Dict:
+        """
+        Legacy interface: Execute one complete timestep.
+        For compatibility with existing code.
+        """
+        return self._step_internal(step, record=True)
