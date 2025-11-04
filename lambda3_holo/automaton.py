@@ -1,30 +1,25 @@
 """
-lambda3_holo/automaton.py - FINAL VERSION with all critical fixes
-Fully reproducible AdS/CFT automaton with proper causality chain
+lambda3_holo/automaton.py - PhaseShift-VIII Enhanced
+Simple, clean, and effective AdS/CFT automaton
+Based on proven PhaseShift-VIII with minimal enhancements
 """
 
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional, Union
-from numpy.random import Generator, PCG64, SeedSequence
-from collections import deque
+from typing import List, Tuple, Dict, Optional
 
 from .geometry import (
     laplacian2d, perimeter_len_bool8, corner_count, count_holes_nonperiodic,
     inner_boundary_band, outer_boundary_band, k_th_largest_mask
 )
-from .config import ModelConfig, AgentDynamics, ResourceDynamics, AdSCFTParams, GeodesicGating, RTWeights
 
-# ========== RNG Utilities ==========
-def make_rng(seed: int, stream_tag: str) -> Generator:
-    """Create an independent RNG stream from seed and tag"""
-    ss = SeedSequence(seed, spawn_key=[hash(stream_tag) & 0xffffffff])
-    return Generator(PCG64(ss))
+# ========== SINGLE RNG - Keep it simple! ==========
+rng = np.random.default_rng(913)
 
 # ========== Data Classes ==========
 @dataclass
 class Cell:
-    """Agent cell with energy, genome, and cooperation level"""
+    """Agent cell with energy, genome, and cooperation"""
     alive: bool
     energy: float
     genome: np.ndarray
@@ -33,125 +28,53 @@ class Cell:
 # ========== Main Automaton Class ==========
 class Automaton:
     """
-    AdS/CFT-aware self-evolving automaton with FIXED causality chain:
-    λ(t) → [HR/gate] → S_RT(t) → boundary(t+1) → bulk(t+1)
-    
-    Critical fixes:
-    - Boundary NOT overwritten by coop_field
-    - Exact gate delay (no off-by-one)
-    - Proper temporal ordering
-    - Agent-boundary weak coupling
+    PhaseShift-VIII Enhanced: Simple and effective
+    - Single RNG for reproducibility
+    - Immediate geodesic gating (no delay complexity)
+    - Multi-objective RT entropy
+    - Clean temporal ordering
     """
     
     def __init__(
         self,
-        config: Optional[ModelConfig] = None,
-        # Grid geometry (legacy params)
         H: int = 44,
         W: int = 44,
         Z: int = 24,
-        # AdS/CFT params (legacy)
         L_ads: float = 1.0,
         alpha: float = 0.9,
-        c0: float = 0.06,
+        c0: float = 0.08,
         gamma: float = 0.9,
-        c_eff_max: float = 0.15,  # Zero-lag suppression
-        # Gating params (legacy)
-        gate_delay: int = 1,
-        gate_strength: float = 0.15,  # Slightly stronger
-        # SOC (legacy)
-        soc_rate: float = 0.01,
-        # Random seed
+        c_eff_max: float = 0.18,
+        gate_strength: float = 0.25,  # Strong immediate effect
         seed: int = 913
     ):
-        """Initialize automaton with proper configuration"""
+        """Initialize with simple, proven parameters"""
+        global rng
+        rng = np.random.default_rng(seed)
         
-        self.seed = seed
+        self.H, self.W, self.Z = H, W, Z
+        self.L_ads = L_ads
+        self.alpha = alpha
+        self.c0 = c0
+        self.gamma = gamma
+        self.c_eff_max = c_eff_max
+        self.gate_strength = gate_strength
+        self.G_N = 1.0
         
-        # Parse configuration
-        if config is not None:
-            self.H = config.H
-            self.W = config.W
-            self.Z = config.Z
-            self.agent = config.agent
-            self.resource_config = config.resource 
-            self.ads_cft = config.ads_cft
-            self.gating = config.gating
-            self.rt_weights = config.rt_weights
-            self.seed = config.seed
-        else:
-            # Legacy: construct from individual params
-            self.H = H
-            self.W = W
-            self.Z = Z
-            self.agent = AgentDynamics()
-            self.resource_config = ResourceDynamics() 
-            self.ads_cft = AdSCFTParams(
-                L_ADS=L_ads,
-                ALPHA=alpha,
-                C0=c0,
-                GAMMA=gamma,
-                C_EFF_MAX=c_eff_max,
-                BULK_DIFFUSION=0.10  # Reduced for sharper spikes
-            )
-            self.gating = GeodesicGating(
-                GATE_DELAY=gate_delay,
-                GATE_STRENGTH=gate_strength
-            )
-            self.rt_weights = RTWeights()
+        # RT weights for multi-objective
+        self.w_perim = 1.0
+        self.w_holes = 2.0
+        self.w_curv = 0.5
         
-        # Shortcuts
-        self.L_ads = self.ads_cft.L_ADS
-        self.alpha = self.ads_cft.ALPHA
-        self.c0 = self.ads_cft.C0
-        self.gamma = self.ads_cft.GAMMA
-        self.c_eff_max = self.ads_cft.C_EFF_MAX
-        self.gate_delay = self.gating.GATE_DELAY
-        self.gate_strength = self.gating.GATE_STRENGTH
-        self.soc_rate = self.ads_cft.SOC_RATE
-        self.G_N = self.ads_cft.G_N
-        
-        # Phase-aware SOC rates
-        self.soc_rate_burnin = 0.02  # Strong during burn-in
-        self.soc_rate_measure = 0.0  # OFF during measurement
-        self.phase = 'init'
-        
-        # Initialize RNG streams
-        self.rng_core = make_rng(self.seed, "core")
-        self.rng_gate = make_rng(self.seed, "gate")
-        self.rng_noise = make_rng(self.seed, "noise")
-        self.rng_init = make_rng(self.seed, "init")
-        
-        # Full state reset
-        self.reset_state()
-
-    def reset_state(self):
-        """Complete state reset with proper initialization"""
-        H, W, Z = self.H, self.W, self.Z
-        
-        # Clear all arrays
-        self.bulk = np.zeros((H, W, Z), dtype=float)
-        self.boundary = np.zeros((H, W), dtype=float)
-        self.resource = np.ones((H, W), dtype=float)
-        
-        # FIX: Proper gate delay queue (exactly gate_delay slots)
-        L = max(1, int(self.gate_delay))
-        self.pending_gates = deque([None]*L, maxlen=L)
-        
-        # Lambda history for z-score
-        self._lambda_hist = deque(maxlen=50)
-        
-        # Current c_eff
-        self.c_eff_current = self.c0
-        
-        # Initialize grid
+        # Initialize state
         self.grid = self._init_grid()
-        self._apply_spatial_pattern()
+        self.resource = np.ones((H, W), dtype=float)
+        self.bulk = np.zeros((H, W, Z), dtype=float)
         
-        # Initialize boundary (only once!)
+        # Initialize boundary from cooperation
         self.boundary = self.coop_field()
-        self._apply_spatial_seed()
-
+        self._apply_spatial_pattern()
+    
     def _init_grid(self) -> List[List[Cell]]:
         """Initialize agent grid"""
         grid = []
@@ -160,55 +83,38 @@ class Automaton:
             for j in range(self.W):
                 row.append(Cell(
                     alive=True,
-                    energy=float(1.0 + 0.2 * self.rng_init.standard_normal()),
-                    genome=self.rng_init.integers(0, 2, size=56, dtype=np.int8),
-                    coop=float(np.clip(0.5 + 0.2 * self.rng_init.standard_normal(), 0, 1))
+                    energy=1.0 + 0.2 * rng.standard_normal(),
+                    genome=rng.integers(0, 2, size=56, dtype=np.int8),
+                    coop=np.clip(0.5 + 0.2 * rng.standard_normal(), 0, 1)
                 ))
             grid.append(row)
         return grid
     
     def _apply_spatial_pattern(self):
-        """Apply checkerboard + Gaussian patterns"""
+        """Apply initial spatial pattern to break symmetry"""
         H, W = self.H, self.W
+        
+        # Checkerboard
         for i in range(H):
             for j in range(W):
                 if ((i // 4 + j // 4) % 2) == 0:
-                    self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 1.25, 0, 1))
+                    self.grid[i][j].coop *= 1.25
                 else:
-                    self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 0.75, 0, 1))
+                    self.grid[i][j].coop *= 0.75
+                self.grid[i][j].coop = np.clip(self.grid[i][j].coop, 0, 1)
         
+        # Central boost
         cy, cx = H // 2, W // 2
         for i in range(H):
             for j in range(W):
                 r2 = (i - cy)**2 + (j - cx)**2
                 boost = np.exp(-r2 / (H / 4)**2)
-                self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * (1 + 0.4 * boost), 0, 1))
-
-    def _apply_spatial_seed(self):
-        """Add EXTREME spatial roughness to break λ=1 lock-in"""
-        H, W = self.H, self.W
-        B = self.boundary
-        
-        for i in range(H):
-            for j in range(W):
-                if ((i // 2 + j // 2) & 1) == 0:
-                    B[i, j] = np.clip(B[i, j] * 1.5 + 0.1, 0, 1)
-                else:
-                    B[i, j] = np.clip(B[i, j] * 0.5 - 0.1, 0, 1)
-        
-        cy, cx = H // 2, W // 2
-        for i in range(H):
-            for j in range(W):
-                r2 = (i - cy)**2 + (j - cx)**2
-                bump = np.exp(-r2 / (H / 6)**2)
-                B[i, j] = np.clip(B[i, j] + 0.3 * bump, 0, 1)
-        
-        noise = self.rng_init.uniform(-0.1, 0.1, (H, W))
-        B[:] = np.clip(B + noise, 0, 0.95)  # ★ここ！1を0.95に変える！
-        self.boundary = B
-
+                self.grid[i][j].coop = np.clip(
+                    self.grid[i][j].coop * (1 + 0.4 * boost), 0, 1
+                )
+    
     def coop_field(self) -> np.ndarray:
-        """Extract cooperation field from agent grid"""
+        """Extract cooperation field from agents"""
         M = np.zeros((self.H, self.W), dtype=float)
         for i in range(self.H):
             for j in range(self.W):
@@ -216,19 +122,19 @@ class Automaton:
                     M[i, j] = self.grid[i][j].coop
         return M
     
+    def K_over_V(self, B: np.ndarray) -> np.ndarray:
+        """Compute Lambda = K/V field"""
+        coop = np.clip(B, 0, 1)
+        gx = np.roll(coop, -1, 1) - coop
+        gy = np.roll(coop, -1, 0) - coop
+        K = np.sqrt(gx * gx + gy * gy) + 1e-12
+        V = np.abs(coop - coop.mean()) + 1e-12
+        return K / V
+    
     def step_agents(self):
-        """Update agents WITHOUT overwriting boundary!"""
+        """Update agent dynamics"""
         H, W = self.H, self.W
         C = self.coop_field()
-        
-        harvest_rate = self.agent.HARVEST_RATE
-        share_rate = self.agent.SHARE_RATE
-        coop_update_rate = self.agent.COOP_UPDATE_RATE
-        thermal_noise = self.agent.THERMAL_NOISE
-        death_threshold = self.agent.DEATH_THRESHOLD
-        birth_threshold = self.agent.BIRTH_THRESHOLD
-        birth_prob = self.agent.BIRTH_PROBABILITY
-        mutation_rate = self.agent.MUTATION_RATE
         
         for i in range(H):
             for j in range(W):
@@ -236,64 +142,40 @@ class Automaton:
                 if not c.alive:
                     continue
                 
-                take = min(harvest_rate, self.resource[i, j])
+                # Harvest
+                take = min(0.05, self.resource[i, j])
                 self.resource[i, j] -= take
                 c.energy += take
                 
-                give = min(share_rate * c.coop, c.energy)
+                # Share
+                give = min(0.02 * c.coop, c.energy)
                 if give > 0:
                     q = 0.25 * give
-                    self.grid[(i + 1) % H][j].energy += q
-                    self.grid[(i - 1) % H][j].energy += q
-                    self.grid[i][(j + 1) % W].energy += q
-                    self.grid[i][(j - 1) % W].energy += q
+                    self.grid[(i+1)%H][j].energy += q
+                    self.grid[(i-1)%H][j].energy += q
+                    self.grid[i][(j+1)%W].energy += q
+                    self.grid[i][(j-1)%W].energy += q
                     c.energy -= give
                 
+                # Update cooperation
                 neigh = 0.25 * (
-                    C[(i + 1) % H][j] + C[(i - 1) % H][j] +
-                    C[i][(j + 1) % W] + C[i][(j - 1) % W]
+                    C[(i+1)%H][j] + C[(i-1)%H][j] +
+                    C[i][(j+1)%W] + C[i][(j-1)%W]
                 )
-                c.coop += coop_update_rate * (neigh - c.coop) 
-                c.coop += thermal_noise * self.rng_noise.standard_normal()
-                c.coop = float(np.clip(c.coop, 0, 1))
+                c.coop += 0.05 * (neigh - c.coop) + 0.01 * rng.standard_normal()
+                c.coop = np.clip(c.coop, 0, 1)
                 
-                if c.energy < death_threshold:
+                # Death
+                if c.energy < 0.15:
                     c.alive = False
                     c.coop = 0.0
-                elif c.energy > birth_threshold and self.rng_core.random() < birth_prob:
-                    child = Cell(
-                        True,
-                        c.energy * 0.5,
-                        self._mutate(c.genome, mutation_rate),
-                        c.coop
-                    )
-                    c.energy *= 0.5
-                    ii = (i + self.rng_core.integers(-1, 2)) % H
-                    jj = (j + self.rng_core.integers(-1, 2)) % W
-                    self.grid[ii][jj] = child
         
         # Update resources
-        self.resource += self.resource_config.RESOURCE_DIFFUSION * laplacian2d(self.resource)
-        self.resource += self.resource_config.RESOURCE_REPLENISH
-        self.resource = np.clip(self.resource, 0, self.resource_config.RESOURCE_MAX)
-        
-        # CRITICAL: NO boundary overwrite here!
-    
-    def agents_to_boundary_coupling(self, rate: float = 0.20):
-        """NEW: Weak coupling from agents to boundary"""
-        C = self.coop_field()
-        self.boundary += rate * (C - self.boundary)
-        self.boundary = np.clip(self.boundary, 0, 1)
-    
-    def _mutate(self, genome: np.ndarray, mut_rate: float) -> np.ndarray:
-        """Mutate genome"""
-        g = genome.copy()
-        flips = self.rng_core.random(len(g)) < mut_rate
-        g[flips] = 1 - g[flips]
-        return g
+        self.resource += 0.03 * laplacian2d(self.resource) + 0.004
+        self.resource = np.clip(self.resource, 0, 3)
     
     def update_bulk(self):
-        """Update bulk from CURRENT boundary"""
+        """Update bulk from boundary"""
         L0 = self.K_over_V(self.boundary)
         self.bulk[..., 0] = L0
         dz = 1.0 / self.Z
@@ -301,21 +183,8 @@ class Automaton:
         
         for k in range(1, self.Z):
             warp = (self.L_ads / z[k])**2
-            prev = self.bulk[..., k - 1]
-            mixed = prev + self.ads_cft.BULK_DIFFUSION * laplacian2d(prev)
-            self.bulk[..., k] = np.clip(warp * mixed, 0, None)
-    
-    def update_bulk_from(self, Bsrc: np.ndarray):
-        """NEW: Update bulk from specified source"""
-        L0 = self.K_over_V(Bsrc)
-        self.bulk[..., 0] = L0
-        dz = 1.0 / self.Z
-        z = (np.arange(self.Z) + 1) * dz
-        
-        for k in range(1, self.Z):
-            warp = (self.L_ads / z[k])**2
-            prev = self.bulk[..., k - 1]
-            mixed = prev + self.ads_cft.BULK_DIFFUSION * laplacian2d(prev)
+            prev = self.bulk[..., k-1]
+            mixed = prev + 0.012 * laplacian2d(prev)
             self.bulk[..., k] = np.clip(warp * mixed, 0, None)
     
     def HR(self, c_eff: float):
@@ -336,220 +205,147 @@ class Automaton:
             np.roll(B, 1, 1) + np.roll(B, -1, 1)
         )
         payoff = neigh * (1.4 - 0.6 * B) - 0.4 * B * (1 - neigh)
-        self.boundary += self.ads_cft.BOUNDARY_PAYOFF_RATE * payoff
+        self.boundary += 0.08 * payoff
         self.boundary = np.clip(self.boundary, 0, 1)
     
-    def K_over_V(self, B: np.ndarray) -> np.ndarray:
-        """Compute Lambda = K/V field"""
-        coop = np.clip(B, 0, 1)
-        gx = np.roll(coop, -1, 1) - coop
-        gy = np.roll(coop, -1, 0) - coop
-        K = np.sqrt(gx * gx + gy * gy) + 1e-10
-        V = np.abs(coop - float(coop.mean())) + 1e-10
-        return K / V
-    
-    def SOC_tune(self):
-        """Phase-aware SOC"""
-        rate = self.soc_rate_burnin if self.phase == 'burnin' else self.soc_rate_measure
-        if rate == 0.0:
-            return
-        
-        Lb = self.K_over_V(self.coop_field())
-        delta = float(Lb.mean() - self.ads_cft.LAMBDA_CRITICAL)
+    def SOC_tune(self, rate: float = 0.01):
+        """Self-organized criticality"""
+        L = self.K_over_V(self.coop_field())
+        delta = L.mean() - 1.0
         self.boundary = np.clip(self.boundary - rate * delta, 0, 1)
     
     def region_A(self, step: int) -> np.ndarray:
-        """Define region A (consider using k=0 fixed for stability)"""
+        """Define region A (alternating k)"""
         C = self.coop_field()
         alive = C > 0
         if alive.sum() == 0:
             R = np.zeros((self.H, self.W), bool)
-            R[:, :self.W // 2] = True
+            R[:, :self.W//2] = True
             return R
-        thr = float(np.median(C[alive]))
+        
+        thr = np.median(C[alive])
         high = C >= thr
-        k = 0  # Fixed largest cluster for stability
+        k = 0 if (step % 2 == 0) else 1
         R = k_th_largest_mask(high, k)
         if R.sum() == 0:
             R = k_th_largest_mask(high, 0)
         return R
     
-    def S_RT_multiobjective(
-        self,
-        R: np.ndarray,
-        w_len: Optional[float] = None,
-        w_hole: Optional[float] = None,
-        w_curv: Optional[float] = None
-    ) -> Tuple[float, Dict[str, float]]:
+    def S_RT_multiobjective(self, R: np.ndarray) -> Tuple[float, Dict]:
         """Multi-objective RT entropy"""
-        if w_len is None:
-            w_len = self.rt_weights.WEIGHT_PERIMETER
-        if w_hole is None:
-            w_hole = self.rt_weights.WEIGHT_HOLES
-        if w_curv is None:
-            w_curv = self.rt_weights.WEIGHT_CURVATURE
-        
         perim = perimeter_len_bool8(R)
         holes = count_holes_nonperiodic(R)
-        curv = float(corner_count(R))
-        S = (w_len * perim + w_hole * holes + w_curv * curv) / (4.0 * self.G_N)
+        curv = corner_count(R)
         
-        return float(S), dict(
-            perimeter=float(perim),
-            holes=float(holes),
-            curvature=float(curv)
-        )
-
-    def _apply_pending_gate_exact(self) -> int:
-        """Apply gate with exact delay (maintain queue length)"""
-        if self.gate_delay <= 0:
+        S = (self.w_perim * perim + 
+             self.w_holes * holes + 
+             self.w_curv * curv) / (4.0 * self.G_N)
+        
+        return S, {
+            'perimeter': perim,
+            'holes': holes,
+            'curvature': curv
+        }
+    
+    def geodesic_gating(self, R: np.ndarray, Lb: np.ndarray) -> int:
+        """Immediate geodesic gating when λ spikes"""
+        out = outer_boundary_band(R, 1)
+        if not out.any():
             return 0
         
-        # キューが空なら何もしない
-        if len(self.pending_gates) == 0:
+        vals = Lb[out]
+        if len(vals) < 10:
             return 0
-            
-        mask = self.pending_gates.popleft()
-        self.pending_gates.append(None)  # ★長さ維持のため空を追加
         
-        if mask is not None and mask.any():
-            self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
-            self.boundary = np.clip(self.boundary, 0, 1)
-            return int(mask.sum())
+        # Detect outlier
+        q1, q3 = np.percentile(vals, [25, 75])
+        iqr = q3 - q1 + 1e-12
+        thresh = q3 + 1.5 * iqr
+        lam_p99 = np.percentile(vals, 99)
+        
+        if lam_p99 > thresh:
+            # Apply gate immediately!
+            self.boundary[out] = np.clip(
+                self.boundary[out] + self.gate_strength * (1.0 - self.boundary[out]), 
+                0, 1
+            )
+            return int(out.sum())
         return 0
     
-    def _detect_outlier_enhanced(self, series_window: np.ndarray) -> bool:
-        """Enhanced outlier detection"""
-        q1, q3 = np.percentile(series_window, [25, 75])
-        iqr = max(q3 - q1, 1e-12)
-        if series_window[-1] > q3 + 1.5 * iqr:
-            return True
+    def step(self, step: int) -> Dict:
+        """Single simulation step with clean ordering"""
         
-        mean = float(series_window.mean())
-        std = float(series_window.std() + 1e-12)
-        if (series_window[-1] - mean) / std > 2.5:
-            return True
-        return False
-    
-    def _step_internal(self, step: int, record: bool = True) -> Optional[Dict]:
-        """シンプル＆同時点測定"""
-        applied_pixels = 0 
+        # 1. Update agents
+        self.step_agents()
+        self.boundary = self.coop_field()
         
-        # ===== 1. 現在時点の測定（全部同じ境界で！） =====
-        B_now = self.boundary.copy()
-        Lambda_b = self.K_over_V(B_now)
+        # 2. Update bulk
+        self.update_bulk()
+        
+        # 3. Define region A
         R = self.region_A(step)
         
-        out_band = outer_boundary_band(R, 1)
-        in_band = inner_boundary_band(R, 1)
+        # 4. Measure PRE values
+        Lb_pre = self.K_over_V(self.boundary)
+        out = outer_boundary_band(R, 1)
+        inn = inner_boundary_band(R, 1)
         
-        # 同時点で測定！
-        lam_p99_out = float(np.percentile(Lambda_b[out_band], 99)) if out_band.any() else np.nan
-        lam_p99_in = float(np.percentile(Lambda_b[in_band], 99)) if in_band.any() else np.nan
-        S_mo, parts = self.S_RT_multiobjective(R)  # ← 同じRで測定
+        lam_p99_out = np.percentile(Lb_pre[out], 99) if out.any() else np.nan
+        lam_p99_in = np.percentile(Lb_pre[inn], 99) if inn.any() else np.nan
         
-        # ===== 2. 物理更新（シンプルに順番に） =====
-        # Bulk
-        self.update_bulk_from(B_now)
+        # 5. Dynamic c_eff
+        med_global = np.median(Lb_pre)
+        if out.any():
+            norm_tail = lam_p99_out / (med_global + 1e-12) - 1.0
+        else:
+            norm_tail = 0.0
+        norm_tail = np.clip(norm_tail, -0.5, 3.0)
+        c_eff = np.clip(self.c0 * (1.0 + self.gamma * norm_tail), 
+                        self.c0, self.c_eff_max)
         
-        # HR
-        self.HR(self.c_eff_current)
+        # 6. HR
+        self.HR(c_eff)
         
-        # ゲート検出＆適用
-        self._lambda_hist.append(lam_p99_out)
-        if len(self._lambda_hist) == self._lambda_hist.maxlen:
-            window = np.array(self._lambda_hist)
-            if self._detect_outlier_enhanced(window) and out_band.any():
-                vals = Lambda_b[out_band]
-                p98 = np.percentile(vals, 98)
-                mask = out_band & (Lambda_b >= p98)
-                if mask.any():
-                    pixels = int(mask.sum())
-                    print(f"[DEBUG] Gate triggered! pixels={pixels}")
-                    print(f"[DEBUG] Before gate: boundary mean={self.boundary.mean():.3f}")
-                    
-                    # ★境界を下げる方向に変更！
-                    self.boundary[mask] *= (1.0 - self.gate_strength)  # 15%減少
-                    # または
-                    # self.boundary[mask] -= self.gate_strength * self.boundary[mask]
-                    
-                    self.boundary = np.clip(self.boundary, 0, 1)
-                    print(f"[DEBUG] After gate: boundary mean={self.boundary.mean():.3f}")
-                    applied_pixels = pixels
+        # 7. Geodesic gating (immediate!)
+        gate_px = self.geodesic_gating(R, Lb_pre)
         
-        print(f"[DEBUG] applied_pixels before return: {applied_pixels}") 
-        
-        # Payoff & SOC
+        # 8. Boundary dynamics
         self.update_boundary_payoff()
         self.SOC_tune()
         
-        # Agents & Coupling
-        self.step_agents()
-        self.agents_to_boundary_coupling(rate=0.20)
-        
-        # c_eff更新（次ステップ用）
-        z = 0.0
-        if len(self._lambda_hist) >= 10:
-            arr = np.array(self._lambda_hist)
-            mu, sd = arr.mean(), arr.std() + 1e-12
-            z = (lam_p99_out - mu) / sd
-        
-        self.c_eff_current = float(np.clip(
-            self.c0 * (1.0 + self.gamma * max(0.0, z)),
-            self.c0, self.c_eff_max
-        ))
-        
-        # ノイズ
-        self.boundary += 0.002 * self.rng_noise.standard_normal(self.boundary.shape)
-        self.boundary = np.clip(self.boundary, 0, 1)
-        
-        if not record:
-            return None
-        
-        # ===== 3. 記録（同時点測定値を使う！） =====
-        if step % 25 == 0:
-            print(f"[t={step:03d}] λ={lam_p99_out:.3f}  S_RT={S_mo:.3f}  "
-                  f"gate={applied_pixels}  c_eff={self.c_eff_current:.3f}")
+        # 9. Measure RT entropy
+        S_RT, parts = self.S_RT_multiobjective(R)
         
         return dict(
             t=step,
-            entropy_RT_mo=S_mo,  # ← 同時点！
-            lambda_p99_A_out_pre=lam_p99_out,  # ← 同時点！
+            entropy_RT_mo=S_RT,
+            lambda_p99_A_out_pre=lam_p99_out,
             lambda_p99_A_in_pre=lam_p99_in,
-            region_A_size=float(R.sum()),
-            region_A_perimeter=parts["perimeter"],
-            region_A_holes=parts["holes"],
-            region_A_curvature=parts["curvature"],
-            c_eff=self.c_eff_current,
-            gate_applied_px=applied_pixels
+            region_A_size=R.sum(),
+            region_A_perimeter=parts['perimeter'],
+            region_A_holes=parts['holes'],
+            region_A_curvature=parts['curvature'],
+            c_eff=c_eff,
+            gate_applied_px=gate_px
         )
-        
-        print(f"[DEBUG] gate_applied_px in dict: {result['gate_applied_px']}")  # ★確認！
     
-        return result
-    
-    def run_with_burnin(self, burn_in: int = 250, measure_steps: int = 300) -> List[Dict]:
-        """Run with phase-aware SOC"""
-        self.phase = 'burnin'
-        print(f"[BURN-IN] Running {burn_in} steps with SOC={self.soc_rate_burnin}...")
+    def run_with_burnin(self, burn_in: int = 200, measure_steps: int = 300) -> List[Dict]:
+        """Run with burn-in period"""
+        print(f"[BURN-IN] Running {burn_in} steps...")
         for t in range(burn_in):
-            self._step_internal(t, record=False)
+            _ = self.step(t)
         
-        self.phase = 'measure'
-        print(f"[MEASURE] Recording {measure_steps} steps with SOC={self.soc_rate_measure}...")
+        print(f"[MEASURE] Recording {measure_steps} steps...")
         rows = []
         for t in range(measure_steps):
-            rec = self._step_internal(burn_in + t, record=True)
-            rec['t'] = t
+            rec = self.step(burn_in + t)
+            rec['t'] = t  # Reset to measurement time
             rows.append(rec)
+            
+            if t % 25 == 0:
+                print(f"[t={t:03d}] λ={rec['lambda_p99_A_out_pre']:.1f}  "
+                      f"S_RT={rec['entropy_RT_mo']:.1f}  "
+                      f"gate={rec['gate_applied_px']}  "
+                      f"c_eff={rec['c_eff']:.3f}")
         
         return rows
-    
-    def step_once(self, step: int, weights: Optional[Tuple[float, float, float]] = None) -> Dict:
-        """Legacy interface"""
-        if weights is not None:
-            self.rt_weights.WEIGHT_PERIMETER = weights[0]
-            self.rt_weights.WEIGHT_HOLES = weights[1]
-            self.rt_weights.WEIGHT_CURVATURE = weights[2]
-        
-        return self._step_internal(step, record=True)
