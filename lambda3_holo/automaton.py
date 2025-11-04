@@ -235,9 +235,9 @@ class Automaton:
                     self.grid[ii][jj] = child
         
         # Resource dynamics
-        self.resource += self.resource.RESOURCE_DIFFUSION * laplacian2d(self.resource)
-        self.resource += self.resource.RESOURCE_REPLENISH
-        self.resource = np.clip(self.resource, 0, self.resource.RESOURCE_MAX)
+        self.resource += self.agent.RESOURCE_DIFFUSION * laplacian2d(self.resource)
+        self.resource += self.agent.RESOURCE_REPLENISH
+        self.resource = np.clip(self.resource, 0, self.agent.RESOURCE_MAX)
 
     def update_bulk(self):
         L0 = self.K_over_V(self.boundary)
