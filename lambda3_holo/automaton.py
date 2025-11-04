@@ -464,17 +464,14 @@ class Automaton:
                 p98 = np.percentile(vals, 98)
                 mask = out_band & (Lambda_b >= p98)
                 if mask.any():
-                    pixels = int(mask.sum())
-                    print(f"[DEBUG] Gate triggered! pixels={pixels}")
+                    applied_pixels = int(mask.sum())  # ここで代入
+                    print(f"[DEBUG] Gate triggered! pixels={applied_pixels}")
+                    print(f"[DEBUG] Before gate: boundary mean={self.boundary.mean():.3f}")
                     self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
                     self.boundary = np.clip(self.boundary, 0, 1)
-                    applied_pixels = pixels
-                else:
-                    applied_pixels = 0
-            else:
-                applied_pixels = 0
-        else:
-            applied_pixels = 0
+                    print(f"[DEBUG] After gate: boundary mean={self.boundary.mean():.3f}")
+        
+        print(f"[DEBUG] applied_pixels before return: {applied_pixels}") 
         
         # Payoff & SOC
         self.update_boundary_payoff()
@@ -520,6 +517,10 @@ class Automaton:
             c_eff=self.c_eff_current,
             gate_applied_px=applied_pixels
         )
+        
+        print(f"[DEBUG] gate_applied_px in dict: {result['gate_applied_px']}")  # ★確認！
+    
+        return result
     
     def run_with_burnin(self, burn_in: int = 250, measure_steps: int = 300) -> List[Dict]:
         """Run with phase-aware SOC"""
