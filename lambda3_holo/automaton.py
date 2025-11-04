@@ -482,12 +482,17 @@ class Automaton:
                 cand = out_band_pre & (Lambda_b_pre >= p98)
                 new_mask = cand if cand.any() else None
         
+        # ★修正：長さを維持しながらエンキュー★
         if self.gate_delay > 0:
+            # 長さが足りない場合は補充
+            while len(self.pending_gates) < self.gate_delay:
+                self.pending_gates.append(None)
+            
             # 多重発火抑制
-            if not any(m is not None for m in self.pending_gates):
-                self.pending_gates.append(new_mask)  # appendで追加！
-            else:
-                self.pending_gates.append(None)  # 空でも長さ維持
+            if new_mask is not None and any(m is not None for m in self.pending_gates):
+                new_mask = None  # すでに何か入ってたらスキップ
+            
+            self.pending_gates.append(new_mask) 
         
         # I) NOW update agents (AFTER boundary measurements)
         self.step_agents()
