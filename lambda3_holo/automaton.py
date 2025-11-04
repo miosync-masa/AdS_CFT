@@ -433,6 +433,7 @@ class Automaton:
     
     def _step_internal(self, step: int, record: bool = True) -> Optional[Dict]:
         """シンプル＆同時点測定"""
+        gate_px = 0  
         
         # ===== 1. 現在時点の測定（全部同じ境界で！） =====
         B_now = self.boundary.copy()
@@ -463,7 +464,7 @@ class Automaton:
                 p98 = np.percentile(vals, 98)
                 mask = out_band & (Lambda_b >= p98)
                 if mask.any():
-                    # delay=0なら即適用
+                    print(f"[DEBUG] Gate triggered! pixels={mask.sum()}")  # デバッグ！
                     self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
                     self.boundary = np.clip(self.boundary, 0, 1)
                     gate_px = int(mask.sum())
