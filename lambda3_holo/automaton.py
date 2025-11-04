@@ -1,6 +1,6 @@
 """
-lambda3_holo/automaton.py - Complete version with all required patches
-Fully reproducible AdS/CFT automaton with proper temporal ordering
+lambda3_holo/automaton.py - FINAL VERSION with all critical fixes
+Fully reproducible AdS/CFT automaton with proper causality chain
 """
 
 import numpy as np
@@ -17,10 +17,7 @@ from .config import ModelConfig, AgentDynamics, ResourceDynamics, AdSCFTParams, 
 
 # ========== RNG Utilities ==========
 def make_rng(seed: int, stream_tag: str) -> Generator:
-    """
-    Create an independent RNG stream from seed and tag.
-    Ensures complete independence across subsystems.
-    """
+    """Create an independent RNG stream from seed and tag"""
     ss = SeedSequence(seed, spawn_key=[hash(stream_tag) & 0xffffffff])
     return Generator(PCG64(ss))
 
@@ -36,16 +33,14 @@ class Cell:
 # ========== Main Automaton Class ==========
 class Automaton:
     """
-    AdS/CFT-aware self-evolving automaton with holographic renormalization
-    and delayed geodesic gating. Fixed temporal ordering ensures positive lag.
+    AdS/CFT-aware self-evolving automaton with FIXED causality chain:
+    λ(t) → [HR/gate] → S_RT(t) → boundary(t+1) → bulk(t+1)
     
-    Key features:
-    - Complete RNG independence between subsystems
-    - Proper delay queue with deque for exact timing
-    - Correct temporal ordering: λ(t) → gate(t+delay) → S_RT(t+delay)
-    - Burn-in period support for stability
-    - Zero-lag suppression via c_eff delay
-    - Phase-aware SOC control to prevent λ=1 lock-in
+    Critical fixes:
+    - Boundary NOT overwritten by coop_field
+    - Exact gate delay (no off-by-one)
+    - Proper temporal ordering
+    - Agent-boundary weak coupling
     """
     
     def __init__(
@@ -58,32 +53,23 @@ class Automaton:
         # AdS/CFT params (legacy)
         L_ads: float = 1.0,
         alpha: float = 0.9,
-        c0: float = 0.06,  # Slightly reduced
+        c0: float = 0.06,
         gamma: float = 0.9,
-        c_eff_max: float = 0.15,  # Reduced for zero-lag suppression
+        c_eff_max: float = 0.15,  # Zero-lag suppression
         # Gating params (legacy)
         gate_delay: int = 1,
-        gate_strength: float = 0.15,
+        gate_strength: float = 0.15,  # Slightly stronger
         # SOC (legacy)
         soc_rate: float = 0.01,
         # Random seed
         seed: int = 913
     ):
-        """
-        Initialize automaton with either ModelConfig or individual parameters.
+        """Initialize automaton with proper configuration"""
         
-        Args:
-            config: Complete ModelConfig object (overrides all other params)
-            H, W, Z: Grid dimensions
-            seed: Random seed for reproducibility
-        """
-        
-        # Store seed for reproducibility
         self.seed = seed
         
         # Parse configuration
         if config is not None:
-            # Use config object
             self.H = config.H
             self.W = config.W
             self.Z = config.Z
@@ -105,7 +91,8 @@ class Automaton:
                 ALPHA=alpha,
                 C0=c0,
                 GAMMA=gamma,
-                C_EFF_MAX=c_eff_max
+                C_EFF_MAX=c_eff_max,
+                BULK_DIFFUSION=0.10  # Reduced for sharper spikes
             )
             self.gating = GeodesicGating(
                 GATE_DELAY=gate_delay,
@@ -113,7 +100,7 @@ class Automaton:
             )
             self.rt_weights = RTWeights()
         
-        # Shortcuts for frequently used values
+        # Shortcuts
         self.L_ads = self.ads_cft.L_ADS
         self.alpha = self.ads_cft.ALPHA
         self.c0 = self.ads_cft.C0
@@ -124,12 +111,12 @@ class Automaton:
         self.soc_rate = self.ads_cft.SOC_RATE
         self.G_N = self.ads_cft.G_N
         
-        # PATCH 1: SOC rates for different phases
-        self.soc_rate_burnin = 0.02      # Increased from 0.01
-        self.soc_rate_measure = 0.0      # Complete OFF during measurement!
+        # Phase-aware SOC rates
+        self.soc_rate_burnin = 0.02  # Strong during burn-in
+        self.soc_rate_measure = 0.0  # OFF during measurement
         self.phase = 'init'
         
-        # Initialize independent RNG streams
+        # Initialize RNG streams
         self.rng_core = make_rng(self.seed, "core")
         self.rng_gate = make_rng(self.seed, "gate")
         self.rng_noise = make_rng(self.seed, "noise")
@@ -138,8 +125,35 @@ class Automaton:
         # Full state reset
         self.reset_state()
 
+    def reset_state(self):
+        """Complete state reset with proper initialization"""
+        H, W, Z = self.H, self.W, self.Z
+        
+        # Clear all arrays
+        self.bulk = np.zeros((H, W, Z), dtype=float)
+        self.boundary = np.zeros((H, W), dtype=float)
+        self.resource = np.ones((H, W), dtype=float)
+        
+        # FIX: Proper gate delay queue (exactly gate_delay slots)
+        L = max(1, int(self.gate_delay))
+        self.pending_gates = deque([None]*L, maxlen=L)
+        
+        # Lambda history for z-score
+        self._lambda_hist = deque(maxlen=50)
+        
+        # Current c_eff
+        self.c_eff_current = self.c0
+        
+        # Initialize grid
+        self.grid = self._init_grid()
+        self._apply_spatial_pattern()
+        
+        # Initialize boundary (only once!)
+        self.boundary = self.coop_field()
+        self._apply_spatial_seed()
+
     def _init_grid(self) -> List[List[Cell]]:
-        """Initialize agent grid using dedicated init RNG stream"""
+        """Initialize agent grid"""
         grid = []
         for i in range(self.H):
             row = []
@@ -154,10 +168,8 @@ class Automaton:
         return grid
     
     def _apply_spatial_pattern(self):
-        """Apply deterministic spatial patterns (checkerboard + Gaussian)"""
+        """Apply checkerboard + Gaussian patterns"""
         H, W = self.H, self.W
-        
-        # Checkerboard pattern
         for i in range(H):
             for j in range(W):
                 if ((i // 4 + j // 4) % 2) == 0:
@@ -165,7 +177,6 @@ class Automaton:
                 else:
                     self.grid[i][j].coop = float(np.clip(self.grid[i][j].coop * 0.75, 0, 1))
         
-        # Gaussian boost at center
         cy, cx = H // 2, W // 2
         for i in range(H):
             for j in range(W):
@@ -178,7 +189,6 @@ class Automaton:
         H, W = self.H, self.W
         B = self.boundary
         
-        # Enhanced checkerboard (2x2 blocks)
         for i in range(H):
             for j in range(W):
                 if ((i // 2 + j // 2) & 1) == 0:
@@ -186,7 +196,6 @@ class Automaton:
                 else:
                     B[i, j] = np.clip(B[i, j] * 0.5 - 0.1, 0, 1)
         
-        # Strong Gaussian bump
         cy, cx = H // 2, W // 2
         for i in range(H):
             for j in range(W):
@@ -194,39 +203,9 @@ class Automaton:
                 bump = np.exp(-r2 / (H / 6)**2)
                 B[i, j] = np.clip(B[i, j] + 0.3 * bump, 0, 1)
         
-        # Strong noise
         noise = self.rng_init.uniform(-0.1, 0.1, (H, W))
         B[:] = np.clip(B + noise, 0, 1)
-        
         self.boundary = B
-
-    def reset_state(self):
-        """Complete state reset to ensure reproducibility"""
-        H, W, Z = self.H, self.W, self.Z
-        
-        # Clear all arrays
-        self.bulk = np.zeros((H, W, Z), dtype=float)
-        self.boundary = np.zeros((H, W), dtype=float)
-        self.resource = np.ones((H, W), dtype=float)
-        
-        # Use deque for exact delay (FIFO queue)
-        self.pending_gates = deque(maxlen=self.gate_delay + 1)
-        for _ in range(self.gate_delay + 1):
-            self.pending_gates.append(None)
-        
-        # PATCH 3: Lambda history with shorter window for z-score
-        self._lambda_hist = deque(maxlen=50)
-        
-        # Current c_eff
-        self.c_eff_current = self.c0
-        
-        # Initialize grid
-        self.grid = self._init_grid()
-        self._apply_spatial_pattern()
-        
-        # Initialize boundary
-        self.boundary = self.coop_field()
-        self._apply_spatial_seed()
 
     def coop_field(self) -> np.ndarray:
         """Extract cooperation field from agent grid"""
@@ -238,11 +217,10 @@ class Automaton:
         return M
     
     def step_agents(self):
-        """Update agent dynamics using dedicated RNG streams"""
+        """Update agents WITHOUT overwriting boundary!"""
         H, W = self.H, self.W
         C = self.coop_field()
         
-        # Get config values
         harvest_rate = self.agent.HARVEST_RATE
         share_rate = self.agent.SHARE_RATE
         coop_update_rate = self.agent.COOP_UPDATE_RATE
@@ -258,12 +236,10 @@ class Automaton:
                 if not c.alive:
                     continue
                 
-                # Harvest resources
                 take = min(harvest_rate, self.resource[i, j])
                 self.resource[i, j] -= take
                 c.energy += take
                 
-                # Share with neighbors
                 give = min(share_rate * c.coop, c.energy)
                 if give > 0:
                     q = 0.25 * give
@@ -273,7 +249,6 @@ class Automaton:
                     self.grid[i][(j - 1) % W].energy += q
                     c.energy -= give
                 
-                # Update cooperation
                 neigh = 0.25 * (
                     C[(i + 1) % H][j] + C[(i - 1) % H][j] +
                     C[i][(j + 1) % W] + C[i][(j - 1) % W]
@@ -282,12 +257,9 @@ class Automaton:
                 c.coop += thermal_noise * self.rng_noise.standard_normal()
                 c.coop = float(np.clip(c.coop, 0, 1))
                 
-                # Death check
                 if c.energy < death_threshold:
                     c.alive = False
                     c.coop = 0.0
-                
-                # Birth
                 elif c.energy > birth_threshold and self.rng_core.random() < birth_prob:
                     child = Cell(
                         True,
@@ -300,20 +272,29 @@ class Automaton:
                     jj = (j + self.rng_core.integers(-1, 2)) % W
                     self.grid[ii][jj] = child
         
-        # Update resource field
+        # Update resources
         self.resource += self.resource_config.RESOURCE_DIFFUSION * laplacian2d(self.resource)
         self.resource += self.resource_config.RESOURCE_REPLENISH
         self.resource = np.clip(self.resource, 0, self.resource_config.RESOURCE_MAX)
+        
+        # CRITICAL: NO boundary overwrite here!
+        # self.boundary = self.coop_field()  ← DELETED!
+    
+    def agents_to_boundary_coupling(self, rate: float = 0.20):
+        """NEW: Weak coupling from agents to boundary"""
+        C = self.coop_field()
+        self.boundary += rate * (C - self.boundary)
+        self.boundary = np.clip(self.boundary, 0, 1)
     
     def _mutate(self, genome: np.ndarray, mut_rate: float) -> np.ndarray:
-        """Mutate genome using core RNG"""
+        """Mutate genome"""
         g = genome.copy()
         flips = self.rng_core.random(len(g)) < mut_rate
         g[flips] = 1 - g[flips]
         return g
     
     def update_bulk(self):
-        """Update bulk Lambda field with AdS warping"""
+        """Update bulk from CURRENT boundary"""
         L0 = self.K_over_V(self.boundary)
         self.bulk[..., 0] = L0
         dz = 1.0 / self.Z
@@ -325,8 +306,21 @@ class Automaton:
             mixed = prev + self.ads_cft.BULK_DIFFUSION * laplacian2d(prev)
             self.bulk[..., k] = np.clip(warp * mixed, 0, None)
     
+    def update_bulk_from(self, Bsrc: np.ndarray):
+        """NEW: Update bulk from specified source"""
+        L0 = self.K_over_V(Bsrc)
+        self.bulk[..., 0] = L0
+        dz = 1.0 / self.Z
+        z = (np.arange(self.Z) + 1) * dz
+        
+        for k in range(1, self.Z):
+            warp = (self.L_ads / z[k])**2
+            prev = self.bulk[..., k - 1]
+            mixed = prev + self.ads_cft.BULK_DIFFUSION * laplacian2d(prev)
+            self.bulk[..., k] = np.clip(warp * mixed, 0, None)
+    
     def HR(self, c_eff: float):
-        """Holographic renormalization: bulk → boundary feedback"""
+        """Holographic renormalization"""
         dz = 1.0 / self.Z
         z = (np.arange(self.Z) + 1) * dz
         w = np.exp(-self.alpha * z)
@@ -336,7 +330,7 @@ class Automaton:
         self.boundary = np.clip(self.boundary, 0, 1)
     
     def update_boundary_payoff(self):
-        """Update boundary via game-theoretic payoff"""
+        """Game-theoretic payoff dynamics"""
         B = self.boundary
         neigh = 0.25 * (
             np.roll(B, 1, 0) + np.roll(B, -1, 0) +
@@ -347,7 +341,7 @@ class Automaton:
         self.boundary = np.clip(self.boundary, 0, 1)
     
     def K_over_V(self, B: np.ndarray) -> np.ndarray:
-        """Compute Lambda = K/V field with increased epsilon"""
+        """Compute Lambda = K/V field"""
         coop = np.clip(B, 0, 1)
         gx = np.roll(coop, -1, 1) - coop
         gy = np.roll(coop, -1, 0) - coop
@@ -356,10 +350,8 @@ class Automaton:
         return K / V
     
     def SOC_tune(self):
-        """Self-organized criticality with phase-aware rate"""
+        """Phase-aware SOC"""
         rate = self.soc_rate_burnin if self.phase == 'burnin' else self.soc_rate_measure
-        
-        # Skip completely during measurement phase
         if rate == 0.0:
             return
         
@@ -368,7 +360,7 @@ class Automaton:
         self.boundary = np.clip(self.boundary - rate * delta, 0, 1)
     
     def region_A(self, step: int) -> np.ndarray:
-        """Define region A for RT entropy calculation"""
+        """Define region A (consider using k=0 fixed for stability)"""
         C = self.coop_field()
         alive = C > 0
         if alive.sum() == 0:
@@ -377,7 +369,7 @@ class Automaton:
             return R
         thr = float(np.median(C[alive]))
         high = C >= thr
-        k = 0 if (step % 2 == 0) else 1
+        k = 0  # Fixed largest cluster for stability
         R = k_th_largest_mask(high, k)
         if R.sum() == 0:
             R = k_th_largest_mask(high, 0)
@@ -390,7 +382,7 @@ class Automaton:
         w_hole: Optional[float] = None,
         w_curv: Optional[float] = None
     ) -> Tuple[float, Dict[str, float]]:
-        """Compute multi-objective RT entropy"""
+        """Multi-objective RT entropy"""
         if w_len is None:
             w_len = self.rt_weights.WEIGHT_PERIMETER
         if w_hole is None:
@@ -409,31 +401,25 @@ class Automaton:
             curvature=float(curv)
         )
     
-    def _compute_gate_mask_exact(self, Lambda_b: np.ndarray, R: np.ndarray) -> np.ndarray:
-        """Compute gate mask deterministically"""
-        out_band = outer_boundary_band(R, 1)
-        if not out_band.any():
-            return None
-        
-        vals = Lambda_b[out_band]
-        p98 = np.percentile(vals, 98)
-        mask = out_band & (Lambda_b >= p98)
-        return mask if mask.any() else None
-    
     def _apply_pending_gate_exact(self) -> int:
-        """PATCH 2: Apply gate from exactly delay steps ago (apply-once FIFO)"""
-        if len(self.pending_gates) > 0:
-            # Pop oldest mask and immediately append None to maintain length
-            mask = self.pending_gates.popleft()
-            self.pending_gates.append(None)
-            if mask is not None and mask.any():
-                self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
-                self.boundary = np.clip(self.boundary, 0, 1)
-                return int(mask.sum())
-        return 0
+        """FIX: Apply gate with exact delay (no off-by-one)"""
+        if self.gate_delay <= 0:
+            return 0
+        
+        mask = self.pending_gates.popleft()  # Exactly delay steps ago
+        if mask is not None and mask.any():
+            self.boundary[mask] += self.gate_strength * (1.0 - self.boundary[mask])
+            self.boundary = np.clip(self.boundary, 0, 1)
+            applied = int(mask.sum())
+        else:
+            applied = 0
+        
+        # Advance queue
+        self.pending_gates.append(None)
+        return applied
     
     def _detect_outlier_enhanced(self, series_window: np.ndarray) -> bool:
-        """PATCH 4: Enhanced outlier detection with relaxed Z threshold"""
+        """Enhanced outlier detection"""
         q1, q3 = np.percentile(series_window, [25, 75])
         iqr = max(q3 - q1, 1e-12)
         if series_window[-1] > q3 + 1.5 * iqr:
@@ -441,81 +427,61 @@ class Automaton:
         
         mean = float(series_window.mean())
         std = float(series_window.std() + 1e-12)
-        # Reduced threshold: 3.0 → 2.5
         if (series_window[-1] - mean) / std > 2.5:
             return True
         return False
     
     def _step_internal(self, step: int, record: bool = True) -> Optional[Dict]:
-        """Fixed temporal ordering with phase-aware SOC"""
+        """CRITICAL: Proper causal ordering"""
         
-        # ===== A. MEASURE PRE-LAMBDA =====
+        # A) Pre-snapshot (this is "time t boundary")
         B_pre = self.boundary.copy()
         Lambda_b_pre = self.K_over_V(B_pre)
-        R = self.region_A(step)  # ★最初はRのままで！
-        out_band = outer_boundary_band(R, 1)
-        in_band = inner_boundary_band(R, 1)
+        R_pre = self.region_A(step)
+        out_band_pre = outer_boundary_band(R_pre, 1)
+        in_band_pre = inner_boundary_band(R_pre, 1)
         
-        lam_p99_out_pre = float(np.percentile(Lambda_b_pre[out_band], 99)) if out_band.any() else np.nan
-        lam_p99_in_pre = float(np.percentile(Lambda_b_pre[in_band], 99)) if in_band.any() else np.nan
+        lam_p99_out_pre = float(np.percentile(Lambda_b_pre[out_band_pre], 99)) if out_band_pre.any() else np.nan
+        lam_p99_in_pre = float(np.percentile(Lambda_b_pre[in_band_pre], 99)) if in_band_pre.any() else np.nan
         
-        # ===== B. PHYSICS UPDATES =====
-        self.step_agents()
-        self.boundary = self.coop_field()
+        # B) Bulk from PRE boundary
+        self.update_bulk_from(B_pre)
         
-        # ===== C. BULK UPDATE =====
-        self.update_bulk()
-        
-        # ===== D. HOLOGRAPHIC RENORMALIZATION =====
+        # C) HR with delayed c_eff
         self.HR(self.c_eff_current)
         
-        # ===== E. APPLY PENDING GATE =====
+        # D) Apply delayed gate
         gate_px = self._apply_pending_gate_exact()
         
-        # ===== F. BOUNDARY UPDATES =====
+        # E) Boundary dynamics
         self.update_boundary_payoff()
         self.SOC_tune()
         
-        # ===== G. MEASURE POST-S_RT（★更新後の領域で再計算！） =====
-        R = self.region_A(step)  # ★ここで取り直す！
-        S_mo, parts = self.S_RT_multiobjective(R)
+        # F) Measure S_RT with POST geometry
+        R_post = self.region_A(step)
+        S_mo, parts = self.S_RT_multiobjective(R_post)
         
-        # PATCH 5: Add micro dithering noise
-        self.boundary += 0.002 * self.rng_noise.standard_normal(self.boundary.shape)
-        self.boundary = np.clip(self.boundary, 0, 1)
-        
-        # ===== H. DETECT AND ENQUEUE NEW GATE =====
+        # G) Detect new spike and enqueue
         self._lambda_hist.append(lam_p99_out_pre)
+        new_mask = None
         if len(self._lambda_hist) == self._lambda_hist.maxlen:
             window = np.array(self._lambda_hist)
-            if self._detect_outlier_enhanced(window):
-                if out_band.any():
-                    vals = Lambda_b_pre[out_band]
-                    p98 = np.percentile(vals, 98)
-                    new_mask = out_band & (Lambda_b_pre >= p98)
-                    new_mask = new_mask if new_mask.any() else None
-                else:
-                    new_mask = None
-            else:
-                new_mask = None
-        else:
-            new_mask = None
+            if self._detect_outlier_enhanced(window) and out_band_pre.any():
+                vals = Lambda_b_pre[out_band_pre]
+                p98 = np.percentile(vals, 98)
+                cand = out_band_pre & (Lambda_b_pre >= p98)
+                new_mask = cand if cand.any() else None
         
-        # ★多重発火抑制
-        if any(m is not None for m in self.pending_gates):
-            new_mask = None
+        # Multi-fire suppression and enqueue
+        if self.gate_delay > 0 and not any(m is not None for m in self.pending_gates):
+            self.pending_gates[-1] = new_mask
         
-        # ★エンキューを忘れずに！
-        self.pending_gates[-1] = new_mask
-        
-        # ===== I. COMPUTE NEXT c_eff (z-score amplification) =====
+        # H) Compute next c_eff (z-score amplification)
+        z = 0.0
         if len(self._lambda_hist) >= 10:
             arr = np.array(self._lambda_hist, dtype=float)
-            mu = float(arr.mean())
-            sd = float(arr.std() + 1e-12)
+            mu, sd = float(arr.mean()), float(arr.std() + 1e-12)
             z = (lam_p99_out_pre - mu) / sd
-        else:
-            z = 0.0
         
         self.c_eff_current = float(np.clip(
             self.c0 * (1.0 + self.gamma * max(0.0, z)),
@@ -523,20 +489,28 @@ class Automaton:
             self.c_eff_max
         ))
         
+        # I) NOW update agents (AFTER boundary measurements)
+        self.step_agents()
+        
+        # J) Agent→Boundary weak coupling
+        self.agents_to_boundary_coupling(rate=0.20)
+        
+        # K) Micro noise
+        self.boundary += 0.002 * self.rng_noise.standard_normal(self.boundary.shape)
+        self.boundary = np.clip(self.boundary, 0, 1)
+        
         if not record:
             return None
         
         # Debug logging
         if step % 25 == 0:
-            pending_has_gate = any(m is not None for m in self.pending_gates)
-            print(f"[t={step:03d}] λ_pre={lam_p99_out_pre:.3f} "
-                  f"S_RT={S_mo:.3f} queue={'Y' if pending_has_gate else 'N'} "
-                  f"c_eff={self.c_eff_current:.3f}")
+            print(f"[t={step:03d}] λ_pre={lam_p99_out_pre:.3f}  S_RT={S_mo:.3f}  "
+                  f"gate_px={gate_px}  c_eff={self.c_eff_current:.3f}")
         
         return dict(
             t=step,
             entropy_RT_mo=S_mo,
-            region_A_size=float(R.sum()),
+            region_A_size=float(R_post.sum()),
             region_A_perimeter=parts["perimeter"],
             region_A_holes=parts["holes"],
             region_A_curvature=parts["curvature"],
@@ -549,14 +523,12 @@ class Automaton:
         )
     
     def run_with_burnin(self, burn_in: int = 250, measure_steps: int = 300) -> List[Dict]:
-        """Run simulation with phase-aware SOC control"""
-        # Burn-in phase with normal SOC
+        """Run with phase-aware SOC"""
         self.phase = 'burnin'
         print(f"[BURN-IN] Running {burn_in} steps with SOC={self.soc_rate_burnin}...")
         for t in range(burn_in):
             self._step_internal(t, record=False)
         
-        # Measurement phase with SOC completely OFF
         self.phase = 'measure'
         print(f"[MEASURE] Recording {measure_steps} steps with SOC={self.soc_rate_measure}...")
         rows = []
@@ -568,7 +540,7 @@ class Automaton:
         return rows
     
     def step_once(self, step: int, weights: Optional[Tuple[float, float, float]] = None) -> Dict:
-        """Legacy interface: Execute one complete timestep"""
+        """Legacy interface"""
         if weights is not None:
             self.rt_weights.WEIGHT_PERIMETER = weights[0]
             self.rt_weights.WEIGHT_HOLES = weights[1]
