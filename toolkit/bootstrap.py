@@ -1,19 +1,18 @@
 # %%
-# Holographic Stats Toolkit — PRD-grade statistical augmentation
-# ---------------------------------------------------------------
+# Holographic Stats Toolkit — PRD-grade statistical augmentation (Colab Edition)
+# -------------------------------------------------------------------------------
 # What this cell does:
-# 1) Load time series (S_RT, lambda_p99) from CSV if found under /mnt/data (or synthetic fallback)
+# 1) Load time series (S_RT, lambda_p99) from CSV in /content/ (or synthetic fallback)
 # 2) Spearman/Pearson with 1000× moving-block bootstrap → 95% CI
 # 3) Lag-of-peak correlation with bootstrap CI
 # 4) Transfer Entropy (discrete estimator) with surrogate test (circular-shift) → p-values
 # 5) Sensitivity sweeps (analysis-layer): TE bins, TE delay, embedding length
-# 6) Save figures & a summary CSV to /mnt/data/holo_stats/
+# 6) Save figures & summary CSV to /content/holo_stats/
 #
 # Input CSV expectations (auto-detection, case-insensitive):
 #   columns: 't', 'S_RT', 'lambda_p99'   (extra columns allowed; only these three are used)
 #
 # If no CSV present, we synthesize a causal pair with lag ~ +6 as a demonstration.
-# Re-run this cell after placing your metrics CSV(s) into /mnt/data/ (e.g., '/mnt/data/metrics_ixb.csv').
 
 import os
 import re
@@ -24,19 +23,12 @@ from typing import Tuple, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
-# Try to import the display helper (graceful fallback)
-try:
-    from ace_tools import display_dataframe_to_user
-except Exception:
-    def display_dataframe_to_user(name: str, dataframe: pd.DataFrame):
-        print(f"\n[{name}]")
-        print(dataframe.head(20).to_string(index=False))
+from IPython.display import display
 
 # -----------------------------
 # Utility: ensure output folder
 # -----------------------------
-OUT_DIR = "/mnt/data/holo_stats"
+OUT_DIR = "/content/holo_stats"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 rng = np.random.default_rng(42)
@@ -45,12 +37,14 @@ rng = np.random.default_rng(42)
 # 0) Data loading or synthesis
 # -----------------------------
 def _find_candidate_csvs() -> List[str]:
-    cands = glob.glob("/mnt/data/*.csv")
+    """Find CSV files in /content/ directory"""
+    cands = glob.glob("/content/*.csv")
     # Heuristics: prefer files with 'metrics' or 'out' in name
     cands_sorted = sorted(cands, key=lambda p: (0 if re.search(r'metric|out|ixb|ixc', os.path.basename(p), re.I) else 1, p))
     return cands_sorted
 
 def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize column names to t, S_RT, lambda_p99"""
     cols = {c.lower(): c for c in df.columns}
     map_needed = {}
     # Accept variations like s_rt, srt, lambda_p99, lambda99, etc.
@@ -60,8 +54,8 @@ def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
                 return cols[k]
         return None
     col_t = pick(['t','time','step'])
-    col_s = pick(['s_rt','srt','rt','entropy','s'])
-    col_l = pick(['lambda_p99','lambda99','lambda_out_p99','lambda','lam','lam_p99'])
+    col_s = pick(['s_rt','srt','rt','entropy','s','entropy_rt_mo'])
+    col_l = pick(['lambda_p99','lambda99','lambda_out_p99','lambda','lam','lam_p99','lambda_p99_a_out_pre'])
     if col_t is None:
         df['t'] = np.arange(len(df))
         col_t = 't'
@@ -70,15 +64,21 @@ def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={col_t:'t', col_s:'S_RT', col_l:'lambda_p99'})[['t','S_RT','lambda_p99']]
 
 def load_or_synthesize() -> Tuple[pd.DataFrame, str]:
+    """Load CSV or create synthetic data"""
     for path in _find_candidate_csvs():
         try:
             df0 = pd.read_csv(path)
             df = _standardize_columns(df0)
             if not df.empty and len(df) >= 100:
+                print(f"✓ Loaded data from: {path}")
+                print(f"  Shape: {df.shape}, Time points: {len(df)}")
                 return df.reset_index(drop=True), path
-        except Exception:
+        except Exception as e:
+            print(f"⚠️  Failed to load {path}: {e}")
             continue
+    
     # Synthesize if nothing usable was found
+    print("⚠️  No suitable CSV found. Generating synthetic data...")
     n = 300
     # latent AR(1)
     x = np.zeros(n)
@@ -99,6 +99,7 @@ df, source_path = load_or_synthesize()
 
 # Save the working copy
 df.to_csv(os.path.join(OUT_DIR, "working_timeseries.csv"), index=False)
+print(f"✓ Saved working data to: {OUT_DIR}/working_timeseries.csv\n")
 
 # -----------------------------------------
 # 1) Spearman/Pearson with 1000× bootstrap
@@ -119,6 +120,7 @@ def bootstrap_corr(x: np.ndarray,
                    n_boot: int = 1000,
                    block_len: int = 10,
                    seed: int = 123) -> Dict[str, float]:
+    """Bootstrap correlation with moving-block resampling"""
     rng_local = np.random.default_rng(seed)
     n = len(x)
     # Use local RNG inside
@@ -150,6 +152,7 @@ def bootstrap_corr(x: np.ndarray,
 # 2) Lag-of-peak correlation + bootstrap CI
 # -----------------------------------------
 def xcorr_at_lag(x: np.ndarray, y: np.ndarray, lag: int, method='spearman') -> float:
+    """Compute correlation at specific lag"""
     if lag > 0:
         a, b = x[:-lag], y[lag:]
     elif lag < 0:
@@ -172,6 +175,7 @@ def peak_lag_with_ci(x: np.ndarray,
                      block_len: int = 10,
                      method: str = 'spearman',
                      seed: int = 456) -> Dict[str, float]:
+    """Find peak correlation lag with bootstrap CI"""
     # point estimate
     lags = np.arange(-lag_max, lag_max+1)
     vals = np.array([xcorr_at_lag(x,y,l,method) for l in lags])
@@ -202,15 +206,18 @@ def peak_lag_with_ci(x: np.ndarray,
     r_lo, r_hi = np.percentile(r_samples, [2.5, 97.5])
 
     # plot cross-correlation curve
-    fig1 = plt.figure(figsize=(6,4))
-    plt.plot(lags, vals, marker='o')
-    plt.axvline(best_lag, linestyle='--')
-    plt.xlabel("Lag (x leads +)")
-    plt.ylabel(f"{method.title()} correlation")
-    plt.title("Cross-correlation vs lag")
+    fig1 = plt.figure(figsize=(8,5))
+    plt.plot(lags, vals, marker='o', linewidth=2, markersize=4)
+    plt.axvline(best_lag, color='red', linestyle='--', linewidth=2, label=f'Best lag = {best_lag}')
+    plt.axhline(0, color='gray', linestyle='-', linewidth=0.8)
+    plt.xlabel("Lag (x leads +)", fontsize=12)
+    plt.ylabel(f"{method.title()} correlation", fontsize=12)
+    plt.title(f"Cross-correlation vs lag (Best: r={best_r:.3f} at lag={best_lag})", fontsize=13, fontweight='bold')
+    plt.legend()
+    plt.grid(alpha=0.3)
     fig1.tight_layout()
     fig1_path = os.path.join(OUT_DIR, "xcorr_curve.png")
-    fig1.savefig(fig1_path, dpi=150)
+    fig1.savefig(fig1_path, dpi=150, bbox_inches='tight')
     plt.close(fig1)
 
     return {
@@ -226,7 +233,8 @@ def peak_lag_with_ci(x: np.ndarray,
 # -----------------------------------------
 # 3) Transfer Entropy (discrete) + surrogate
 # -----------------------------------------
-def discretize(a: np.ndarray, n_bins: int = 8) -> np.ndarray:
+def discretize(a: np.ndarray, n_bins: int = 8) -> Tuple[np.ndarray, np.ndarray]:
+    """Discretize array using quantile binning"""
     # equal-frequency binning (quantile)
     qs = np.linspace(0, 1, n_bins+1)
     edges = np.quantile(a, qs)
@@ -280,8 +288,6 @@ def transfer_entropy_xy(x: np.ndarray,
     P_z   = (counts_z   + pseudocount) / (N + pseudocount * nb)
 
     # TE = sum P(yf, y, x) * log [ P(yf | y, x) / P(yf | y) ]
-    # P(yf | y, x) = P(yf, y, x) / P(y, x)
-    # P(yf | y) = P(yf, y) / P(y)
     te = 0.0
     for a in range(nb):
         for b in range(nb):
@@ -290,13 +296,14 @@ def transfer_entropy_xy(x: np.ndarray,
                 p_yx = P_zy[b,c]
                 p_yf_y = P_yz[a,b]
                 p_y = P_z[b]
-                # compute conditional terms (avoid log of 0 with pseudocount)
+                # compute conditional terms
                 p1 = p_xyz / p_yx
                 p2 = p_yf_y / p_y
                 te += p_xyz * np.log(p1 / p2)
     return float(te)  # nats
 
 def circular_shift(a: np.ndarray, k: int) -> np.ndarray:
+    """Circular shift array by k positions"""
     k = k % len(a)
     if k == 0:
         return a.copy()
@@ -308,6 +315,7 @@ def te_with_surrogates(x: np.ndarray,
                        n_bins: int = 8,
                        n_sur: int = 200,
                        seed: int = 777) -> Dict[str, float]:
+    """Compute TE with surrogate significance test"""
     te_obs = transfer_entropy_xy(x, y, lag=lag, n_bins=n_bins)
     rng_local = np.random.default_rng(seed)
     sur_vals = np.empty(n_sur, dtype=float)
@@ -320,15 +328,17 @@ def te_with_surrogates(x: np.ndarray,
     p = (1.0 + np.sum(sur_vals >= te_obs)) / (n_sur + 1.0)
 
     # plot histogram
-    fig2 = plt.figure(figsize=(6,4))
-    plt.hist(sur_vals, bins=30)
-    plt.axvline(te_obs, linestyle='--')
-    plt.xlabel("TE surrogate values (nats)")
-    plt.ylabel("Count")
-    plt.title(f"Surrogate test for TE(X→Y), lag={lag}, bins={n_bins}")
+    fig2 = plt.figure(figsize=(8,5))
+    plt.hist(sur_vals, bins=30, alpha=0.7, edgecolor='black')
+    plt.axvline(te_obs, color='red', linestyle='--', linewidth=2, label=f'Observed TE = {te_obs:.4f}')
+    plt.xlabel("TE surrogate values (nats)", fontsize=12)
+    plt.ylabel("Count", fontsize=12)
+    plt.title(f"Surrogate test: TE(X→Y), lag={lag}, bins={n_bins}, p={p:.4f}", fontsize=13, fontweight='bold')
+    plt.legend()
+    plt.grid(alpha=0.3, axis='y')
     fig2.tight_layout()
     fig2_path = os.path.join(OUT_DIR, f"te_surrogates_lag{lag}_bins{n_bins}.png")
-    fig2.savefig(fig2_path, dpi=150)
+    fig2.savefig(fig2_path, dpi=150, bbox_inches='tight')
     plt.close(fig2)
 
     return {
@@ -345,13 +355,18 @@ def sensitivity_te_grid(x: np.ndarray,
                         delays: List[int] = [1,2,4,6,8],
                         bins_list: List[int] = [6,8,12],
                         n_sur: int = 200) -> pd.DataFrame:
+    """Grid search over TE parameters"""
     rows = []
+    print("\n" + "="*60)
+    print("Running TE sensitivity analysis...")
+    print("="*60)
     for lag in delays:
         for nb in bins_list:
+            print(f"  lag={lag}, bins={nb}...", end=' ')
             te_xy = transfer_entropy_xy(x, y, lag=lag, n_bins=nb)
             te_yx = transfer_entropy_xy(y, x, lag=lag, n_bins=nb)
-            sur_xy = te_with_surrogates(x, y, lag=lag, n_bins=nb, n_sur=n_sur)
-            sur_yx = te_with_surrogates(y, x, lag=lag, n_bins=nb, n_sur=n_sur)
+            sur_xy = te_with_surrogates(x, y, lag=lag, n_bins=nb, n_sur=n_sur, seed=300+lag*10+nb)
+            sur_yx = te_with_surrogates(y, x, lag=lag, n_bins=nb, n_sur=n_sur, seed=400+lag*10+nb)
             rows.append({
                 'lag': lag,
                 'bins': nb,
@@ -360,27 +375,46 @@ def sensitivity_te_grid(x: np.ndarray,
                 'TE_y_to_x': te_yx,
                 'p_y_to_x': sur_yx['p_value'],
             })
+            print("✓")
     return pd.DataFrame(rows)
 
 # -----------------------------------------
 # Run the full analysis on the loaded data
 # -----------------------------------------
+print("\n" + "="*60)
+print("Running Holographic Stats Analysis...")
+print("="*60)
+
 x = df['lambda_p99'].to_numpy().astype(float)
 y = df['S_RT'].to_numpy().astype(float)
 
 # 1) Spearman/Pearson bootstrap
+print("\n1) Computing Spearman/Pearson correlations with bootstrap CI...")
 spearman_res = bootstrap_corr(x, y, method='spearman', n_boot=1000, block_len=10, seed=101)
 pearson_res  = bootstrap_corr(x, y, method='pearson',  n_boot=1000, block_len=10, seed=102)
+print(f"   Spearman: r={spearman_res['r']:.4f}, 95%CI=[{spearman_res['ci_lo']:.4f}, {spearman_res['ci_hi']:.4f}]")
+print(f"   Pearson:  r={pearson_res['r']:.4f}, 95%CI=[{pearson_res['ci_lo']:.4f}, {pearson_res['ci_hi']:.4f}]")
 
 # 2) Peak lag with CI
+print("\n2) Finding peak correlation lag with bootstrap CI...")
 lag_res = peak_lag_with_ci(x, y, lag_max=24, n_boot=500, block_len=10, method='spearman', seed=202)
+print(f"   Best lag: {lag_res['best_lag']} steps, 95%CI=[{lag_res['lag_ci_lo']:.0f}, {lag_res['lag_ci_hi']:.0f}]")
+print(f"   Correlation at best lag: r={lag_res['best_r']:.4f}")
 
 # 3) TE at (a) lag=1 and (b) best lag from cross-corr
+print("\n3) Computing Transfer Entropy with surrogate tests...")
+print("   a) lag=1...")
 te_lag1_xy = te_with_surrogates(x, y, lag=1, n_bins=8, n_sur=200, seed=301)
 te_lag1_yx = te_with_surrogates(y, x, lag=1, n_bins=8, n_sur=200, seed=302)
-best_lag = max(1, int(lag_res['best_lag']))
+print(f"      TE(λ→S)={te_lag1_xy['te_obs']:.4f}, p={te_lag1_xy['p_value']:.4f}")
+print(f"      TE(S→λ)={te_lag1_yx['te_obs']:.4f}, p={te_lag1_yx['p_value']:.4f}")
+
+best_lag = max(1, abs(int(lag_res['best_lag'])))
+print(f"   b) best lag={best_lag}...")
 te_best_xy = te_with_surrogates(x, y, lag=best_lag, n_bins=8, n_sur=200, seed=303)
 te_best_yx = te_with_surrogates(y, x, lag=best_lag, n_bins=8, n_sur=200, seed=304)
+print(f"      TE(λ→S)={te_best_xy['te_obs']:.4f}, p={te_best_xy['p_value']:.4f}")
+print(f"      TE(S→λ)={te_best_yx['te_obs']:.4f}, p={te_best_yx['p_value']:.4f}")
 
 # 4) TE sensitivity grid
 sens_df = sensitivity_te_grid(x, y, delays=[1,2,4,6,8], bins_list=[6,8,12], n_sur=100)
@@ -418,7 +452,7 @@ summary = pd.DataFrame([{
     'fig_te_sur_lag1_yx': te_lag1_yx['fig_te_surrogates'],
     'fig_te_sur_best_xy': te_best_xy['fig_te_surrogates'],
     'fig_te_sur_best_yx': te_best_yx['fig_te_surrogates'],
-}] )
+}])
 
 summary_path = os.path.join(OUT_DIR, "stats_summary.csv")
 summary.to_csv(summary_path, index=False)
@@ -426,16 +460,30 @@ summary.to_csv(summary_path, index=False)
 # -----------------------------------------
 # Display results to the user
 # -----------------------------------------
-display_dataframe_to_user("Λ³ Holographic Stats — Summary", summary)
-display_dataframe_to_user("Λ³ Holographic Stats — TE Sensitivity Grid", sens_df)
+print("\n" + "="*60)
+print("✓ ANALYSIS COMPLETE")
+print("="*60)
+
+print("\n" + "─"*60)
+print("📊 SUMMARY TABLE")
+print("─"*60)
+display(summary.T)  # Transpose for better readability
+
+print("\n" + "─"*60)
+print("📈 TE SENSITIVITY GRID")
+print("─"*60)
+display(sens_df)
 
 # Print where to find figures/files
-print("\nSaved files:")
-print(f"- Summary CSV: {summary_path}")
-print(f"- TE sensitivity CSV: {sens_path}")
-print(f"- XCorr plot: {lag_res['fig_xcorr']}")
-print(f"- TE surrogate plots:")
-print(f"  * {te_lag1_xy['fig_te_surrogates']}")
-print(f"  * {te_lag1_yx['fig_te_surrogates']}")
-print(f"  * {te_best_xy['fig_te_surrogates']}")
-print(f"  * {te_best_yx['fig_te_surrogates']}")
+print("\n" + "="*60)
+print("📁 SAVED FILES")
+print("="*60)
+print(f"Summary CSV: {summary_path}")
+print(f"TE sensitivity CSV: {sens_path}")
+print(f"XCorr plot: {lag_res['fig_xcorr']}")
+print(f"\nTE surrogate plots:")
+print(f"  • {te_lag1_xy['fig_te_surrogates']}")
+print(f"  • {te_lag1_yx['fig_te_surrogates']}")
+print(f"  • {te_best_xy['fig_te_surrogates']}")
+print(f"  • {te_best_yx['fig_te_surrogates']}")
+print("="*60 + "\n")
