@@ -108,8 +108,8 @@ PhaseShift_X_Validation_Report.md  # Complete analysis report
 
 ```bash
 # Clone repository
-git clone https://github.com/miosync-masa/lambda3-framework.git
-cd lambda3-framework
+git clone https://github.com/miosync-masa/AdS_CFT.git
+cd AdS_CFT
 
 # Requirements (minimal dependencies)
 pip install numpy pandas matplotlib
