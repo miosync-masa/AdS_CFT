@@ -4,6 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+<a href="https://colab.research.google.com/drive/1o0F2noTKmzKDVRMsul9gQBuPU6RSv5tu"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="colab"></a>
+
+
 
 ## Overview
 
