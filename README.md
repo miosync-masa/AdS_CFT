@@ -324,10 +324,7 @@ This work stands on the shoulders of giants:
 - **Thomas Schreiber** (2000): Transfer Entropy formulation
 
 We thank:
-- Tokyo University Engineering Department
-- Nidec Corporation (Nishimura-san)
-- JTEKT and Fujinao collaborators
-- The open-source scientific computing community
+- Thank you for finding it!
 
 ## Contact
 
