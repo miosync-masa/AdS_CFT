@@ -2,7 +2,7 @@
 ## Complete Proof of Entropy-Driven Holographic Correspondence
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17667001.svg)](https://doi.org/10.5281/zenodo.17667001)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 <a href="https://colab.research.google.com/drive/1o0F2noTKmzKDVRMsul9gQBuPU6RSv5tu"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="colab"></a>
 
