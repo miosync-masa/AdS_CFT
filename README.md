@@ -362,7 +362,7 @@ For questions, collaboration proposals, or bug reports, please open an issue or 
 
 ## Version History
 
-- **v1.0.0** (2025-01-XX): Initial release with 14-SEED validation
+- **v1.0.0** (2025-11-04): Initial release with 14-SEED validation
   - Complete entropy-driven causality proof
   - Multi-attractor characterization
   - Publication-ready code and documentation
