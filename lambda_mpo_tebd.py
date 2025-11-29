@@ -318,8 +318,7 @@ class MPS1D_MPO:
         
         L has shape (χ_bra, D_mpo, χ_ket)
         
-        Contraction at each site:
-            L[x,a,y] × A*[x,t,z] × W[a,b,s,t] × A[y,s,d] → L_new[z,b,d]
+        Optimized with sequential tensordot (faster than einsum!)
         
         Complexity: O(N × χ² × D² × d²)
         """
@@ -331,23 +330,27 @@ class MPS1D_MPO:
             A_conj = np.conj(A)     # (χL, d, χR) for bra
             W = mpo.W[i]            # (D_L, D_R, d_ket, d_bra)
             
-            # Full contraction via einsum:
-            # L[x,a,y] × A*[x,t,z] × W[a,b,s,t] × A[y,s,d] → L_new[z,b,d]
+            # Sequential contraction (much faster than einsum!)
             # 
-            # Contracted indices:
-            #   x = χL_bra (L[0], A*[0])
-            #   y = χL_ket (L[2], A[0])
-            #   a = D_L (L[1], W[0])
-            #   t = d' (A*[1], W[3])
-            #   s = d (A[1], W[2])
-            #
-            # Free indices:
-            #   z = χR_bra (A*[2])
-            #   b = D_R (W[1])
-            #   d = χR_ket (A[2])
+            # Step 1: L × A → temp1
+            # L: (χL_bra, D_L, χL_ket), A: (χL_ket, d, χR_ket)
+            # Contract χL_ket → temp1: (χL_bra, D_L, d, χR_ket)
+            temp1 = np.tensordot(L, A, axes=(2, 0))
             
-            L_new = np.einsum('xay,xtz,abst,ysd->zbd', L, A_conj, W, A)
-            L = L_new
+            # Step 2: temp1 × W → temp2
+            # temp1: (χL_bra, D_L, d_ket, χR_ket)
+            # W: (D_L, D_R, d_ket, d_bra)
+            # Contract D_L, d_ket → temp2: (χL_bra, χR_ket, D_R, d_bra)
+            temp2 = np.tensordot(temp1, W, axes=([1, 2], [0, 2]))
+            
+            # Step 3: temp2 × A* → L_new
+            # temp2: (χL_bra, χR_ket, D_R, d_bra)
+            # A*: (χL_bra, d_bra, χR_bra)
+            # Contract χL_bra, d_bra → L_new: (χR_ket, D_R, χR_bra)
+            L_new = np.tensordot(temp2, A_conj, axes=([0, 3], [0, 1]))
+            
+            # Transpose to standard order: (χR_bra, D_R, χR_ket)
+            L = np.transpose(L_new, (2, 1, 0))
         
         # Final: L should be (1, 1, 1) scalar
         return L[0, 0, 0]
