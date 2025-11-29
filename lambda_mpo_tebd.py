@@ -126,13 +126,19 @@ class MPO:
         
         This is a nearest-neighbor two-site operator.
         
-        MPO construction:
-            W = | I    0    0    0   |
-                | Sx   0    0    0   |
-                | Sy   0    0    0   |
-                | 0   2Sy -2Sx   I   |
+        MPO structure (bond dimension D=4):
+            State 0: accumulator (collects completed terms)
+            State 1: Sx placed, waiting for Sy
+            State 2: Sy placed, waiting for Sx
+            State 3: identity pass-through
         
-        Bond dimension = 4
+        Transitions:
+            3 → 1: place Sx (start term)
+            3 → 2: place Sy (start term)
+            1 → 0: place 2Sy (complete Sx·Sy)
+            2 → 0: place -2Sx (complete -Sy·Sx)
+            3 → 3: identity (bulk, pass through)
+            0 → 0: identity (bulk, keep accumulator)
         """
         mpo = cls(N)
         D = 4  # Bond dimension
@@ -140,35 +146,36 @@ class MPO:
         for i in range(N):
             if i == 0:
                 # First site: (1, D, 2, 2)
+                # Can only START terms (no identity to output)
                 W = np.zeros((1, D, 2, 2), dtype=np.complex128)
-                W[0, 0, :, :] = PAULI_I   # Identity path
-                W[0, 1, :, :] = PAULI_X   # Start Sx...
-                W[0, 2, :, :] = PAULI_Y   # Start Sy...
+                W[0, 1, :, :] = PAULI_X   # Start Sx → state 1
+                W[0, 2, :, :] = PAULI_Y   # Start Sy → state 2
+                W[0, 3, :, :] = PAULI_I   # Identity → state 3 (pass-through for N>2)
                 
             elif i == N - 1:
                 # Last site: (D, 1, 2, 2)
+                # Can only COMPLETE terms
                 W = np.zeros((D, 1, 2, 2), dtype=np.complex128)
-                W[0, 0, :, :] = PAULI_I          # Close identity
-                W[1, 0, :, :] = 2.0 * PAULI_Y    # Sx...Sy → +2
-                W[2, 0, :, :] = -2.0 * PAULI_X   # Sy...Sx → -2
+                W[0, 0, :, :] = PAULI_I          # Accumulator: keep sum
+                W[1, 0, :, :] = 2.0 * PAULI_Y    # Complete: Sx → 2Sy
+                W[2, 0, :, :] = -2.0 * PAULI_X   # Complete: Sy → -2Sx
+                # W[3, 0] = 0: identity path ends with nothing
                 
             else:
                 # Bulk site: (D, D, 2, 2)
                 W = np.zeros((D, D, 2, 2), dtype=np.complex128)
                 
-                # Identity passes through
+                # Accumulator keeps accumulating
                 W[0, 0, :, :] = PAULI_I
                 
-                # Start new terms
-                W[0, 1, :, :] = PAULI_X   # Start Sx
-                W[0, 2, :, :] = PAULI_Y   # Start Sy
+                # Complete terms and add to accumulator
+                W[1, 0, :, :] = 2.0 * PAULI_Y    # Sx·Sy term
+                W[2, 0, :, :] = -2.0 * PAULI_X   # -Sy·Sx term
                 
-                # Complete terms and accumulate
-                W[1, 3, :, :] = 2.0 * PAULI_Y    # Sx_i Sy_{i+1}
-                W[2, 3, :, :] = -2.0 * PAULI_X   # -Sy_i Sx_{i+1}
-                
-                # Accumulator passes through
-                W[3, 3, :, :] = PAULI_I
+                # Identity path: start new terms
+                W[3, 1, :, :] = PAULI_X   # Start new Sx
+                W[3, 2, :, :] = PAULI_Y   # Start new Sy
+                W[3, 3, :, :] = PAULI_I   # Pass through
             
             mpo.W[i] = W
         
@@ -179,32 +186,39 @@ class MPO:
         """
         XY Hamiltonian: H = Σ_i (Sx_i Sx_{i+1} + Sy_i Sy_{i+1})
         
-        MPO bond dimension = 4
+        MPO structure (bond dimension D=4):
+            State 0: accumulator
+            State 1: Sx placed, waiting for Sx
+            State 2: Sy placed, waiting for Sy
+            State 3: identity pass-through
         """
         mpo = cls(N)
         D = 4
         
         for i in range(N):
             if i == 0:
+                # First site
                 W = np.zeros((1, D, 2, 2), dtype=np.complex128)
-                W[0, 0, :, :] = PAULI_I
-                W[0, 1, :, :] = PAULI_X
-                W[0, 2, :, :] = PAULI_Y
+                W[0, 1, :, :] = PAULI_X   # Start Sx
+                W[0, 2, :, :] = PAULI_Y   # Start Sy
+                W[0, 3, :, :] = PAULI_I   # Identity for N>2
                 
             elif i == N - 1:
+                # Last site
                 W = np.zeros((D, 1, 2, 2), dtype=np.complex128)
-                W[0, 0, :, :] = PAULI_I
-                W[1, 0, :, :] = PAULI_X   # Complete Sx Sx
-                W[2, 0, :, :] = PAULI_Y   # Complete Sy Sy
+                W[0, 0, :, :] = PAULI_I   # Keep accumulator
+                W[1, 0, :, :] = PAULI_X   # Complete Sx·Sx
+                W[2, 0, :, :] = PAULI_Y   # Complete Sy·Sy
                 
             else:
+                # Bulk site
                 W = np.zeros((D, D, 2, 2), dtype=np.complex128)
-                W[0, 0, :, :] = PAULI_I
-                W[0, 1, :, :] = PAULI_X
-                W[0, 2, :, :] = PAULI_Y
-                W[1, 3, :, :] = PAULI_X
-                W[2, 3, :, :] = PAULI_Y
-                W[3, 3, :, :] = PAULI_I
+                W[0, 0, :, :] = PAULI_I   # Accumulator
+                W[1, 0, :, :] = PAULI_X   # Complete Sx·Sx
+                W[2, 0, :, :] = PAULI_Y   # Complete Sy·Sy
+                W[3, 1, :, :] = PAULI_X   # Start new Sx
+                W[3, 2, :, :] = PAULI_Y   # Start new Sy
+                W[3, 3, :, :] = PAULI_I   # Pass through
             
             mpo.W[i] = W
         
@@ -719,4 +733,4 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("🎉 MPO-TEBD COMPLETE!")
     print("=" * 70)
-    print("\nNow you can simulate N=100+ sites without memory explosion!"
+    print("\nNow you can simulate N=100+ sites without memory explosion!")
